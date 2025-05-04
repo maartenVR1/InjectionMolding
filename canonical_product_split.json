@@ -1,0 +1,31 @@
+{
+    "train_products": [
+        "spoon",
+        "cover_wheel2",
+        "soap_case",
+        "plate_100_60_2",
+        "pet_preform",
+        "heat_sink",
+        "gear_rack",
+        "spur_gear",
+        "split_sprocket_1500",
+        "lego_gear_rack",
+        "plate_200_100_3",
+        "bottle_cap",
+        "cloth_basket",
+        "ice_tray",
+        "drawer_handle",
+        "mug",
+        "bevel_gear",
+        "plate_500_100_4"
+    ],
+    "val_products": [
+        "cup",
+        "plate_250_250_3"
+    ],
+    "test_products": [
+        "split_sprocket_505",
+        "cable_cover",
+        "plate_50_50_1"
+    ]
+}
