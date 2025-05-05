@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 import pandas as pd
 import logging
 
-# Setup logging
+# logging for debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ logger.info(f"Using device: {device}")
 class BenchmarkDataset(Dataset):
     """
     Dataset for benchmark injection molding quality prediction.
-    Directly uses geometric features and process parameters as input.
+    Directly uses geometric features and process parameters as input, no autoencoder invovled.
     """
     def __init__(self, data_csv, input_columns, target_columns, transform=None, target_transform=None, fit_transform=False):
         """
@@ -33,7 +33,6 @@ class BenchmarkDataset(Dataset):
             target_columns (list): Column names for target quality metrics
             transform (callable, optional): Optional transform to be applied on input features
             target_transform (callable, optional): Optional transform to be applied on target values
-            fit_transform (bool): Whether to fit the transforms - should be True only for training data
         """
         self.data = pd.read_csv(data_csv)
         self.input_columns = input_columns
@@ -51,7 +50,7 @@ class BenchmarkDataset(Dataset):
         else:
             self.inputs = self.data[self.input_columns].values
             
-        # Normalize target values (NEW)
+        # Normalize target values because they are in different orders of magnitude
         if self.target_transform:
             if fit_transform:
                 self.targets = self.target_transform.fit_transform(self.data[self.target_columns])
@@ -74,21 +73,10 @@ class BenchmarkDataset(Dataset):
 
 class MLPBenchmarkModel(nn.Module): 
     """
-    MLP model for predicting injection molding quality metrics directly from
-    geometric features and process parameters.
-    this class defines the architecture of the MLP model.
+    MLP architecture for benchmark injection molding quality prediction.
     """
     def __init__(self, input_dim, output_dim, hidden_layers, neurons_per_layer, 
                  activation_fn='relu', dropout_rate=0.0):
-        """
-        Args:
-            input_dim (int): Dimension of input (num_geometric_features + num_process_params)
-            output_dim (int): Dimension of output (number of quality metrics)
-            hidden_layers (int): Number of hidden layers
-            neurons_per_layer (list): Number of neurons in each hidden layer
-            activation_fn (str): Activation function to use
-            dropout_rate (float): Dropout rate to apply after each hidden layer
-        """
         super().__init__()
         
         self.input_dim = input_dim
@@ -183,7 +171,7 @@ class BenchmarkTrainer:
         logger.info(f"Val products: {len(product_split['val_products'])} - {product_split['val_products']}")
         logger.info(f"Test products: {len(product_split['test_products'])} - {product_split['test_products']}")
         
-        # Load all data from multiple subfolders
+        # Load all data from multiple subfolders of all producsts
         data = self._load_multi_folder_data()
         
         # Filter data based on product split
@@ -199,14 +187,14 @@ class BenchmarkTrainer:
         test_csv_path = os.path.join(self.output_dir, 'benchmark_test_data.csv')
         test_data.to_csv(test_csv_path, index=False)
         
-        # Create and fit input scaler only on training data
+        # trainin data scaler
         self.input_scaler = StandardScaler()
         self.input_scaler.fit(train_data[self.input_columns])
         
-        # Add this line to fix the division by zero risk
+        # Division by zer handling (gate location is constant)
         self.input_scaler.scale_[self.input_scaler.scale_ == 0] = 1.0
 
-        # NEW: Create and fit target scaler only on training data
+        # scaler for target values
         self.target_scaler = StandardScaler()
         self.target_scaler.fit(train_data[self.target_columns])
         
@@ -219,7 +207,7 @@ class BenchmarkTrainer:
             train_csv_path, 
             self.input_columns, self.target_columns, 
             transform=self.input_scaler,
-            target_transform=self.target_scaler,  # NEW
+            target_transform=self.target_scaler,  
             fit_transform=False
         )
         
@@ -227,7 +215,7 @@ class BenchmarkTrainer:
             val_csv_path, 
             self.input_columns, self.target_columns, 
             transform=self.input_scaler,
-            target_transform=self.target_scaler,  # NEW
+            target_transform=self.target_scaler,  
             fit_transform=False
         )
         
@@ -235,7 +223,7 @@ class BenchmarkTrainer:
             test_csv_path, 
             self.input_columns, self.target_columns, 
             transform=self.input_scaler,
-            target_transform=self.target_scaler,  # NEW
+            target_transform=self.target_scaler,  
             fit_transform=False
         )
         
@@ -265,10 +253,10 @@ class BenchmarkTrainer:
     
     def _create_model(self, trial: Trial):
         """Create MLP model with parameters suggested by Optuna"""
-        # Suggest number of hidden layers (increase to match Thesis)
+        # Suggest number of hidden layers 
         n_layers = trial.suggest_int('n_layers', 1, 10)
         
-        # Suggest number of neurons for each layer (match Thesis range)
+        # Suggest number of neurons for each layer 
         neurons = []
         for i in range(n_layers):
             neurons.append(trial.suggest_int(f'n_units_l{i}', 16, 512, log=True)) # here we create a list of the amount of neurons per layer
@@ -300,10 +288,10 @@ class BenchmarkTrainer:
                              ['AdamW', 'Adam', 'RMSprop', 'SGD', 
                               'NAdam', 'RAdam', 'Adamax', 'Adagrad'])
         
-        # Suggest learning rate with adjusted range - MOVED DOWN
-        if optimizer_name == 'SGD':  # Fixed reference issue
+        # Suggest learning rate with adjusted range 
+        if optimizer_name == 'SGD':  
             # SGD benefits from higher learning rates
-            lr = trial.suggest_float('lr', 1e-2, 1e-1, log=True)  # Ensure positive lower bound
+            lr = trial.suggest_float('lr', 1e-2, 1e-1, log=True)  
         else:
             # Adaptive optimizers (Adam, AdamW, etc)
             lr = trial.suggest_float('lr', 1e-4, 3e-2, log=True)
@@ -343,11 +331,10 @@ class BenchmarkTrainer:
             criterion = log_cosh_loss
             
         # Add a consistent validation metric
-        fixed_validation_metric = nn.MSELoss()  # Always use MSE for validation
+        fixed_validation_metric = nn.MSELoss()  # Always use MSE for validation, like otther systems as well
         
-        # Consider using fixed max epochs with early stopping like Thesis
         num_epochs = 250
-        patience = 10  # Similar to Thesis early stopping
+        patience = 25 
         
         # Early stopping parameters
         best_val_loss = float('inf')
@@ -357,7 +344,7 @@ class BenchmarkTrainer:
         for epoch in range(num_epochs):
             # Training phase
             model.train()
-            training_loss_sum = 0.0  # Renamed from train_loss
+            training_loss_sum = 0.0 
             
             for batch in self.train_loader:
                 inputs = batch['input'].to(self.device)
@@ -365,7 +352,7 @@ class BenchmarkTrainer:
                 
                 # Forward pass
                 outputs = model(inputs)
-                trial_specific_loss = criterion(outputs, targets)  # Renamed from loss
+                trial_specific_loss = criterion(outputs, targets)  
                 
                 # Backward and optimize
                 optimizer.zero_grad()
@@ -387,11 +374,11 @@ class BenchmarkTrainer:
                     
                     outputs = model(inputs)
                     # Use the fixed metric for validation
-                    validation_loss = fixed_validation_metric(outputs, targets)  # Renamed from loss
+                    validation_loss = fixed_validation_metric(outputs, targets)  
                     
                     validation_loss_sum += validation_loss.item()
 
-            # Calculate average losses with clearer names
+            # Calculate average losses 
             avg_training_loss = training_loss_sum / len(self.train_loader)
             avg_validation_loss = validation_loss_sum / len(self.val_loader)
 
@@ -424,7 +411,6 @@ class BenchmarkTrainer:
                 # Save current trial's best model
                 torch.save(model_info, best_model_path)
 
-                # Most space-efficient: Save ONLY the global best model
                 global_best_path = os.path.join(self.output_dir, 'benchmark_best_model.pt')
 
                 # Check if this is better than global best
@@ -534,7 +520,7 @@ class BenchmarkTrainer:
         return best_model, study
     
     def objective(self, trial: Trial):
-        """Optuna objective function with batch size optimization"""
+        
         # Suggest batch size
         batch_size = trial.suggest_int('batch_size', 
                                       self.batch_size_range[0], 
@@ -633,7 +619,7 @@ class BenchmarkTrainer:
         trials_path = os.path.join(self.output_dir, 'benchmark_study_trials.csv')
         pd.DataFrame(trials_data).to_csv(trials_path, index=False)
         
-        # NEW TXT FILE WRITING
+        # txt file with summary of trials
         summary_path = os.path.join(self.output_dir, 'benchmark_study_summary.txt')
         with open(summary_path, 'w') as f:
             f.write("Benchmark Study Summary\n")
@@ -647,7 +633,6 @@ class BenchmarkTrainer:
                     f.write(f"    {k}: {v}\n")
                 f.write("\n")  # Blank line between trials
         
-        # Visualization code in try/except as before
         try:
             fig = optuna.visualization.plot_optimization_history(study)
             hist_path = os.path.join(self.output_dir, 'benchmark_optimization_history.png')
@@ -678,7 +663,6 @@ class BenchmarkTrainer:
             # Handle numpy arrays
             return self.target_scaler.inverse_transform(normalized_targets)
 
-# Example usage
 if __name__ == "__main__":
     # Main folder containing product subfolders with Excel files
     MAIN_FOLDER = r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master thesis\code\SYSTEM\TrainingData_Benchmark_System"
@@ -686,7 +670,7 @@ if __name__ == "__main__":
     # Create benchmark trainer
     trainer = BenchmarkTrainer(
         main_folder=MAIN_FOLDER,
-        # Updated input column names to match exactly what's in your Excel files
+        
         input_columns=[
             'Cavity Volume (mm3)', 
             'Cavity Surface Area (mm2)', 
@@ -701,7 +685,7 @@ if __name__ == "__main__":
             'Packing Pressure', 
             'Injection Time'
         ],
-        # Updated target column names
+
         target_columns=[
             'CavityWeight', 
             'MaxWarp', 

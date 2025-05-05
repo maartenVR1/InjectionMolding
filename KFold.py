@@ -5,7 +5,7 @@ Grouped k‑fold cross‑validation for ALL three network types used in the thes
 --------------------------------------------------------------------------
 1. **Benchmark System** – classic MLP on 12 geometric + process features
 2. **Sub‑Network System** – hierarchical 3‑tower network (latent / process / fusion)
-3. **Thesis / Normal System** – latent vector concatenated with 8 process parameters
+3. **Thesis / Normal System** – latent vector concatenated with 8 process parameters (of which 4 are gate location related)
 
 For every product the rows belong to the same fold (GroupKFold on "product_name").
 The exact (already optimised) architectures + hyper‑parameters are hard‑coded below.
@@ -56,10 +56,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GroupKFold
 
 # Configuration for repeated cross-validation
-N_REPEATS = 20  # Adjust as needed (3-10 is typical)
+N_REPEATS = 50 
 
 def set_training_seeds(seed):
-    """Set seeds for neural network training randomness only"""
+    #randomness for reproducibility
+    # Set the seed for all random number generators to ensure reproducibility
     random.seed(seed)
     np.random.seed(seed) 
     torch.manual_seed(seed)
@@ -122,7 +123,7 @@ SHARED_DATA_FOLDER = Path(r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master 
 MAIN_FOLDER_SUBNET = SHARED_DATA_FOLDER
 AE_WEIGHTS_SUBNET = Path(r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master thesis\code\SYSTEM\autoencoder_best.pt")  # encoder‑only weights
 
-# best architecture (see user message)
+# best architecture 
 SUB_ARCH = dict(
     lat_hidden=[196, 215, 44, 414, 36, 240, 82, 127, 23, 215],
     proc_hidden=[36],
@@ -171,7 +172,7 @@ THESIS_ARCH = dict(
 )
 
 # --------------------------------------------------------------------------
-# Helper utilities
+# Helper functiosn
 # --------------------------------------------------------------------------
 
 def mse(y_hat: torch.Tensor, y: torch.Tensor) -> float:
@@ -209,7 +210,7 @@ def write_results_to_file(filename, message):
 
 
 # --------------------------------------------------------------------------
-# 1. BENCHMARK CV
+# 1. BENCHMARK Cross validaiton
 # --------------------------------------------------------------------------
 
 def run_benchmark_cv(k: int = 5):
@@ -240,7 +241,6 @@ def run_benchmark_cv(k: int = 5):
         def make_ds(df, is_train):
             tmp_csv = f"__bench_fold{fold}_{'tr' if is_train else 'va'}.csv"
             df.to_csv(tmp_csv, index=False)
-            # FIXED: Hardcode fit_transform=False since we've already fit the scalers
             ds = BenchmarkDataset(
                 tmp_csv, 
                 INPUT_COLS_BENCH, 
@@ -275,8 +275,7 @@ def run_benchmark_cv(k: int = 5):
                 pred = model(batch["input"].to(DEVICE))
                 loss = criterion(pred, batch["target"].to(DEVICE))
                 loss.backward()
-                # Add gradient clipping here
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.008) #clip gradients to prevent explosion
                 optimizer.step()
             # validation
             model.eval(); vals=[]
@@ -309,11 +308,9 @@ def run_subnet_cv(k: int = 5):
     logger.info(f"Available columns: {full_df.columns.tolist()}")
     
     # Fix column name mapping if needed
-    # Example (adjust based on what you see in the debug output):
     rename_map = {}
     if 'Packing pressure' in full_df.columns:  # lowercase 'p'
         rename_map['Packing pressure'] = 'Packing Pressure'
-    # Add more mappings as needed
     
     if rename_map:
         full_df = full_df.rename(columns=rename_map)
@@ -358,24 +355,34 @@ def run_subnet_cv(k: int = 5):
         criterion = nn.MSELoss()
         optimizer = torch.optim.NAdam(model.parameters(), lr=SUB_ARCH["lr"])
 
-        best=float("inf"); patience=10; no_improve=0
+        best = float("inf")
+        patience = 10
+        no_improve = 0
         for _ in range(500):
             model.train()
             for batch in tr_loader:
                 optimizer.zero_grad()
                 pred = model(batch["lat"].to(DEVICE), batch["proc"].to(DEVICE))
-                loss = criterion(pred, batch["target"].to(DEVICE)); loss.backward(); optimizer.step()
+                loss = criterion(pred, batch["target"].to(DEVICE))
+                loss.backward()
+
+                optimizer.step()
+
             # val
-            model.eval(); vals=[]
+            model.eval()
+            vals = []
             with torch.no_grad():
                 for batch in va_loader:
                     pred = model(batch["lat"].to(DEVICE), batch["proc"].to(DEVICE))
                     vals.append(criterion(pred, batch["target"].to(DEVICE)).item())
-            cur=np.mean(vals)
-            if cur<best: best=cur; no_improve=0
+            cur = np.mean(vals)
+            if cur < best:
+                best = cur
+                no_improve = 0
             else:
-                no_improve+=1
-                if no_improve>=patience: break
+                no_improve += 1
+                if no_improve >= patience:
+                    break
         logger.info(f"Fold {fold}/{k}  MSE={best:.5f}")
         scores.append(best)
         fold_scores.append(best)
@@ -431,10 +438,15 @@ def run_thesis_cv(k: int = 5):
         for _ in range(500):
             model.train()
             for batch in tr_loader:
-                optimizer.zero_grad();
-                pred=model(batch["input"].to(DEVICE));
-                loss=criterion(pred, batch["target"].to(DEVICE));
-                loss.backward(); optimizer.step()
+                optimizer.zero_grad()
+                pred = model(batch["input"].to(DEVICE))
+                loss = criterion(pred, batch["target"].to(DEVICE))
+                loss.backward()
+                
+                # Add gradient clipping (adjust max_norm as needed)
+                #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)   #didnt do anything because network is stable by itself, just like the subnet system
+                
+                optimizer.step()
             # val
             model.eval(); vals=[]
             with torch.no_grad():
@@ -471,7 +483,7 @@ if __name__ == "__main__":
     
     for repeat in range(N_REPEATS):
         repeat_header = f"\n==========  REPEAT {repeat+1}/{N_REPEATS}  =========="
-        logger.info(repeat_header)  # Ensure this is logged to console
+        logger.info(repeat_header)  
         write_results_to_file(results_file, f"\n{'='*30} REPEAT {repeat+1}/{N_REPEATS} {'='*30}")
         
         # Set new seed for THIS REPEAT's training randomness
@@ -517,15 +529,12 @@ if __name__ == "__main__":
         runs = np.array(runs)
         mean, std = runs.mean(), runs.std()
         
-        # For console logging - use standard arrow/plus-minus characters
         console_msg = f"{name.capitalize():10} →  {mean:.5f} ± {std:.5f} (across {N_REPEATS} repeats)"
         logger.info(console_msg)
         
-        # For file writing - use ASCII replacements to avoid encoding issues
         file_msg = f"{name.capitalize():10} ->  {mean:.5f} +/- {std:.5f} (across {N_REPEATS} repeats)"
         write_results_to_file(results_file, file_msg)
         
-        # Min/max for both console and file
         min_max_msg = f"{' '*12}Min: {runs.min():.5f}, Max: {runs.max():.5f}"
         logger.info(min_max_msg)
         write_results_to_file(results_file, min_max_msg)

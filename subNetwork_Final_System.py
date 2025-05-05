@@ -25,12 +25,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GroupShuffleSplit
 import optuna
 from optuna.trial import Trial
-
-# Add these imports and warning suppressions
 import warnings
 from sklearn.exceptions import DataConversionWarning
 
-# Suppress specific warnings
+# Suppress specific warnings (annoying ones)
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
 warnings.filterwarnings("ignore", category=DataConversionWarning)
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
@@ -46,7 +44,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {DEVICE}")
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3-D auto-encoder  (updated with decoder)
+# 3-D auto-encoder  (entire architecture)
 # ────────────────────────────────────────────────────────────────────────────
 class FinalAutoencoder3D(nn.Module):
     def __init__(self, latent_dim: int = 256):
@@ -54,7 +52,7 @@ class FinalAutoencoder3D(nn.Module):
         self._device = torch.device("cpu")
         k, p = 3, 1
         
-        # Encoder part - already defined
+        # Encoder components
         self.encoder = nn.Sequential(
             nn.Conv3d(1, 16, k, 2, p), nn.PReLU(),
             nn.Conv3d(16,16, k, 1, p), nn.PReLU(),
@@ -67,7 +65,7 @@ class FinalAutoencoder3D(nn.Module):
         )
         self.fc_mu = nn.Linear(128*8*8*8, latent_dim)
         
-        # Decoder components
+        # latent space to decoder input
         self.fc_dec = nn.Linear(latent_dim, 128*8*8*8)
         
         # Mirror of encoder but with ConvTranspose3d
@@ -100,7 +98,7 @@ def load_autoencoder(path:str, device, latent_dim:int=256):
     chk = torch.load(path, map_location=device)
     sd  = chk["model_state_dict"] if "model_state_dict" in chk else chk
     
-    # Filter to ONLY include encoder parameters and ignore decoder completely
+    # Filter to ONLY include encoder parameters and ignore decoder completely 
     encoder_sd = {k: v for k, v in sd.items() if k.startswith('encoder.') or k.startswith('fc_mu.')}
     
     model = FinalAutoencoder3D(latent_dim).to(device)
@@ -299,7 +297,7 @@ class Trainer:
 
     # ---------- objective ---------------------------------------------------
     def _objective(self, trial:Trial):
-        # Existing hyperparameter suggestions remain unchanged
+        # large range for neurons
         lat_h = [trial.suggest_int(f"lat_h{i}",16,512,log=True)
                  for i in range(trial.suggest_int("lat_layers",1,10))]
         proc_h = [trial.suggest_int(f"prc_h{i}",16,512,log=True)
@@ -307,7 +305,7 @@ class Trainer:
         fuse_h = [trial.suggest_int(f"fus_h{i}",16,512,log=True)
                   for i in range(trial.suggest_int("fuse_layers",1,10))]
         
-        # Activation and dropout parameters remain unchanged
+        # Activation and dropout parameters 
         lat_act = trial.suggest_categorical("lat_act", ["relu","leaky_relu","elu","tanh","selu"])
         proc_act = trial.suggest_categorical("proc_act", ["relu","leaky_relu","elu","tanh","selu"])
         fuse_act = trial.suggest_categorical("fuse_act", ["relu","leaky_relu","elu","tanh","selu"])
@@ -320,13 +318,13 @@ class Trainer:
         opt_n = trial.suggest_categorical("opt", 
                 ["adamw", "adam", "sgd", "rmsprop", "nadam", "radam", "adamax", "adagrad"])
         
-        # Learning rate suggestions remain unchanged
+        # Learning rate depends on SGD or not because SGD is more sensitive
         if opt_n == "sgd":
             lr = trial.suggest_float("lr", 1e-2, 1e-0, log=True)
         else:
             lr = trial.suggest_float("lr", 1e-4, 3e-2, log=True)
 
-        # This loss is only for training
+        # This loss is only for training, we use a fixed metric for validation for good comparison
         loss_n = trial.suggest_categorical("loss", ["mse","mae","huber","smooth_l1","log_cosh"])
         
         train_dl = self._dl(self.train_df, batch, shuffle=True)
@@ -338,7 +336,6 @@ class Trainer:
             lat_act, proc_act, fuse_act,
             lat_drop, proc_drop, fuse_drop).to(DEVICE)
 
-        # CHANGE: Split into training-specific loss and fixed validation metric
         crit_train = make_loss(loss_n)  # Trial-specific loss for training
         fixed_metric = nn.MSELoss()     # Fixed metric for validation
         
@@ -374,7 +371,7 @@ class Trainer:
 
     # -----------------------------------------------------------------------
     def optimize(self):
-        # Study creation unchanged
+        # Study creation Optuna
         study = optuna.create_study(direction="minimize", study_name=self.study_name,
                               storage=self.storage, load_if_exists=True,
                               pruner=optuna.pruners.MedianPruner(10))
@@ -445,7 +442,7 @@ class Trainer:
         # Save study results to text file
         self._save_study_results(study)
         
-        # Save model - update to save in the output directory
+        # Save model
         model_path = self.output_dir / f"best_hier_mlp_{self.study_name}.pt"
         torch.save(
             {"state_dict": model.state_dict(), "params": p,
@@ -574,7 +571,6 @@ PROC_COLS = (
 )
 TGT_COLS = ("CavityWeight", "MaxWarp", "VolumetricShrinkage")
 
-# Update main block to include output directory
 if __name__ == "__main__":
     MAIN_FOLDER = r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master thesis\code\SYSTEM\TrainingData_Thesis_System"
     AUTOENCODER_PATH = r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master thesis\code\SYSTEM\autoencoder_best.pt"

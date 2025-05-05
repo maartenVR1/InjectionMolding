@@ -30,8 +30,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GroupShuffleSplit
 import optuna
 from optuna.trial import Trial
-
-# Add these imports at the top of your file
 import json
 import time
 
@@ -81,7 +79,7 @@ class FinalAutoencoder3D(nn.Module):
             nn.ConvTranspose3d(16,8, 2,2), nn.PReLU(),
             nn.Conv3d(8,8,k,1,p),  nn.PReLU(),
             nn.Conv3d(8,4,k,1,p),  nn.PReLU(),
-            nn.Conv3d(4,1,1),                     # logits
+            nn.Conv3d(4,1,1),                     
         )
 
     @property
@@ -132,7 +130,7 @@ class InjectionMoldingDataset(Dataset):
         else:
             self.proc_arr = self.df[self.proc_cols].values.astype(float)
 
-        # ---------- y : targets  (scaled)             
+        # ---------- y : targets  (also scaled)             
         if scaler_tgt is not None:
             self.tgt_arr = scaler_tgt.transform(
                 self.df[self.tgt_cols].values.astype(float)
@@ -246,7 +244,7 @@ class MLPTrainer:
         n_trials    = 200,
         study_name  = "MLP_quality_prediction",
         storage     = None,
-        # Add new parameter
+        
         output_dir: str = "Thesis_System_Results",
     ):
         self.main_folder = Path(main_folder)
@@ -435,11 +433,9 @@ class MLPTrainer:
         act = trial.suggest_categorical("act", ["relu","leaky_relu","elu","tanh","selu"])
         drop= trial.suggest_float("dropout",0.0,0.5)
         
-        # Add optimizer selection
         opt_name = trial.suggest_categorical("optimizer", 
             ["adamw", "adam", "sgd", "rmsprop", "nadam", "radam", "adamax", "adagrad"])
         
-        # Updated learning rate range based on optimizer
         if opt_name == "sgd":
             # SGD needs higher learning rates
             lr = trial.suggest_float("lr", 1e-2, 1e-1, log=True)  # Changed minimum from 1e-4 to 1e-2
@@ -449,16 +445,16 @@ class MLPTrainer:
         
         batch=trial.suggest_int("batch", self.batch_range[0], self.batch_range[1], log=True)
         
-        # Add loss function selection for TRAINING only
+        # loss function selection for TRAINING only
         loss_name = trial.suggest_categorical("loss_fn", ["mse", "mae", "huber", "smooth_l1", "log_cosh"])
 
         train_dl,val_dl,_ = self._make_dloaders(batch)
         model = MLPQualityPredictor(self.input_dim, self.output_dim, hl, neu, act, drop).to(DEVICE)
         
-        # CHANGE 1: Use selected loss function for TRAINING only, we want to keep the validation metric consistent for comparison
+        # Use selected loss function for TRAINING only, we want to keep the validation metric consistent for comparison
         crit_train = make_loss_function(loss_name)
         
-        # CHANGE 2: Define a consistent validation metric across all trials, I chose MSELoss for this
+        # Define a consistent validation metric across all trials, I chose MSELoss for this
         metric_val_fn = nn.MSELoss()  # Using MSE as the canonical validation metric
         
         opt = make_optimizer(opt_name, model.parameters(), lr)
@@ -539,7 +535,7 @@ class MLPTrainer:
         logger.info(f"Full study results saved to {out_path}")
 
     def _save_test_results_csv(self, train_loss, eval_loss, pred_values, true_values):
-        """Save test results to CSV files"""
+        
         # Save summary metrics
         metrics_path = self.output_dir / f"test_metrics_{self.study_name}.csv"
         with open(metrics_path, "w") as f:
@@ -655,7 +651,6 @@ class MLPTrainer:
         self._save_test_results_csv(test_train_loss_avg, test_eval_loss_avg, 
                                    all_predictions, all_targets)
         
-        # NEW: Save detailed trial information
         self._save_study_results(study)
         
         # ---------- save
@@ -674,7 +669,6 @@ class MLPTrainer:
         
         return model, study
 
-# Add this new function
 def make_optimizer(name: str, model_params, lr: float):
     """Create different optimizers based on name."""
     if name == "adamw":
@@ -685,7 +679,6 @@ def make_optimizer(name: str, model_params, lr: float):
         return optim.SGD(model_params, lr=lr, momentum=0.9)
     elif name == "rmsprop":
         return optim.RMSprop(model_params, lr=lr)
-    # Add these optimizers
     elif name == "nadam":
         return optim.NAdam(model_params, lr=lr)
     elif name == "radam":
@@ -704,11 +697,6 @@ def inverse_transform_tgt(arr, scaler_tgt: StandardScaler):
     """
     Convert a numpy or Torch tensor that lives in *scaled target space*
     back to the original engineering units using `scaler_tgt`.
-
-    Notes
-    -----
-    • Accepts 2-D array-like of shape (batch, n_targets)  
-    • Works for both torch.Tensor and np.ndarray
     """
     was_torch = torch.is_tensor(arr)
     if was_torch:
@@ -718,21 +706,7 @@ def inverse_transform_tgt(arr, scaler_tgt: StandardScaler):
     orig = scaler_tgt.inverse_transform(cpu_arr).astype(np.float32)   # keep float32
     return torch.from_numpy(orig).to(arr.device) if was_torch else orig
 
-    """
-    whenever you want to use the inverse transform, you can call this function and do
 
-    # forward pass (still in scaled space)
-    pred_scaled = model(x)
-
-    # back-to-original units
-    pred_phys = inverse_transform_tgt(pred_scaled, self.scaler_tgt)
-    y_phys    = inverse_transform_tgt(y,            self.scaler_tgt)
-
-    """
-
-# ────────────────────────────────────────────────────────────────────────────
-# ##  CONSTANT COLUMN LISTS  ##
-# ────────────────────────────────────────────────────────────────────────────
 PROC_COLS = (
     "Packing Pressure", 
     "Mold Surface Temperature",
@@ -751,7 +725,7 @@ TGT_COLS = ("CavityWeight", "MaxWarp", "VolumetricShrinkage")
 if __name__ == "__main__":
     MAIN_FOLDER = r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master thesis\code\SYSTEM\TrainingData_Thesis_System"
     AUTOENCODER_PATH = r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master thesis\code\SYSTEM\autoencoder_best.pt"
-    OUTPUT_DIR = "Thesis_System_Results"  # Add this line
+    OUTPUT_DIR = "Thesis_System_Results"  
     
     trainer = MLPTrainer(
         main_folder = MAIN_FOLDER,
@@ -763,6 +737,6 @@ if __name__ == "__main__":
         n_trials = 5000,
         study_name = "mlp_quality_prediction",
         storage = None,
-        output_dir = OUTPUT_DIR,  # Add this line
+        output_dir = OUTPUT_DIR, 
     )
     best_model, study = trainer.optimize()
