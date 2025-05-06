@@ -39,6 +39,15 @@ Training becoming unstable after initially working fine
 
 """
 
+"""
+COMPLEXITY OF EACH MODEL;
+
+-Benchmark System: 6755 parameters (1 layer, 422 neurons)
+-Sub-network system full latent vector: 253.285
+-Thesis system full latent vector: 230.683 parameters (3 hidden layers, 411, 163, 327 neurons)
+
+"""
+
 import os
 import json
 from pathlib import Path

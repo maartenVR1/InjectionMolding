@@ -47,52 +47,101 @@ logger.info(f"Using device: {DEVICE}")
 # 3-D auto-encoder  (entire architecture)
 # ────────────────────────────────────────────────────────────────────────────
 class FinalAutoencoder3D(nn.Module):
-    def __init__(self, latent_dim: int = 256):
+    """
+    Autoencoder for 128^3 volumes.
+    - kernel_size=3, padding=1, stride=2 in each downsample block => 128->64->32->16->8->4
+    - device attribute is stored automatically
+    - latent_dim is a hyperparam for tuning
+    """
+    def __init__(self, latent_dim=512):
         super().__init__()
         self._device = torch.device("cpu")
-        k, p = 3, 1
-        
-        # Encoder components
+
+        # Hardcoded kernel=3, pad=1, stride=2
+        kernel_size = 3
+        padding = 1
+
+        # -- Encoder (4 downsampling blocks) --
         self.encoder = nn.Sequential(
-            nn.Conv3d(1, 16, k, 2, p), nn.PReLU(),
-            nn.Conv3d(16,16, k, 1, p), nn.PReLU(),
-            nn.Conv3d(16,32, k, 2, p), nn.PReLU(),
-            nn.Conv3d(32,32, k, 1, p), nn.PReLU(),
-            nn.Conv3d(32,64, k, 2, p), nn.PReLU(),
-            nn.Conv3d(64,64, k, 1, p), nn.PReLU(),
-            nn.Conv3d(64,128,k, 2, p), nn.PReLU(),
-            nn.Conv3d(128,128,k, 1, p), nn.PReLU(),
+            nn.Conv3d(1, 16, kernel_size=kernel_size, stride=2, padding=padding),
+            nn.PReLU(),
+            nn.Conv3d(16, 16, kernel_size=kernel_size, stride=1, padding=padding),
+            nn.PReLU(),
+
+            nn.Conv3d(16, 32, kernel_size=kernel_size, stride=2, padding=padding),
+            nn.PReLU(),
+            nn.Conv3d(32, 32, kernel_size=kernel_size, stride=1, padding=padding),
+            nn.PReLU(),
+
+            nn.Conv3d(32, 64, kernel_size=kernel_size, stride=2, padding=padding),
+            nn.PReLU(),
+            nn.Conv3d(64, 64, kernel_size=kernel_size, stride=1, padding=padding),
+            nn.PReLU(),
+
+            nn.Conv3d(64, 128, kernel_size=kernel_size, stride=2, padding=padding),
+            nn.PReLU(),
+            nn.Conv3d(128, 128, kernel_size=kernel_size, stride=1, padding=padding),
+            nn.PReLU(),
         )
-        self.fc_mu = nn.Linear(128*8*8*8, latent_dim)
-        
-        # latent space to decoder input
-        self.fc_dec = nn.Linear(latent_dim, 128*8*8*8)
-        
-        # Mirror of encoder but with ConvTranspose3d
+
+        # Flatten => fc => latent
+        self.fc_mu = nn.Linear(128 * 8 * 8 * 8, latent_dim)
+        self.fc_dec = nn.Linear(latent_dim, 128 * 8 * 8 * 8)
+
+        # -- Decoder (5 upsampling blocks) --
         self.decoder = nn.Sequential(
-            nn.ConvTranspose3d(128, 128, k, 1, p), nn.PReLU(),
-            nn.ConvTranspose3d(128, 64, k, 2, p), nn.PReLU(),
-            nn.ConvTranspose3d(64, 64, k, 1, p), nn.PReLU(),
-            nn.ConvTranspose3d(64, 32, k, 2, p), nn.PReLU(),
-            nn.ConvTranspose3d(32, 32, k, 1, p), nn.PReLU(),
-            nn.ConvTranspose3d(32, 16, k, 2, p), nn.PReLU(),
-            nn.ConvTranspose3d(16, 16, k, 1, p), nn.PReLU(),
-            nn.ConvTranspose3d(16, 1, k, 2, p), nn.Sigmoid(),
+            # Block 1: 8³ -> 16³
+            nn.ConvTranspose3d(128, 64, kernel_size=2, stride=2),
+            nn.PReLU(),
+            nn.Conv3d(64, 64, kernel_size=kernel_size, padding=padding),
+            nn.PReLU(),
+
+            # Block 2: 16³ -> 32³
+            nn.ConvTranspose3d(64, 32, kernel_size=2, stride=2),
+            nn.PReLU(),
+            nn.Conv3d(32, 32, kernel_size=kernel_size, padding=padding),
+            nn.PReLU(),
+
+            # Block 3: 32³ -> 64³
+            nn.ConvTranspose3d(32, 16, kernel_size=2, stride=2),
+            nn.PReLU(),
+            nn.Conv3d(16, 16, kernel_size=kernel_size, padding=padding),
+            nn.PReLU(),
+
+            # Block 4: 64³ -> 128³
+            nn.ConvTranspose3d(16, 8, kernel_size=2, stride=2),
+            nn.PReLU(),
+            nn.Conv3d(8, 8, kernel_size=kernel_size, padding=padding),
+            nn.PReLU(),
+
+            # Block 5: Additional refinement at 128³ resolution
+            nn.Conv3d(8, 4, kernel_size=kernel_size, padding=padding),
+            nn.PReLU(),
+            nn.Conv3d(4, 1, kernel_size=1),
         )
 
     @property
-    def device(self): return self._device
-    
-    def to(self, device): super().to(device); self._device = device; return self
-    
-    def encode(self,x): return self.fc_mu(self.encoder(x).flatten(1))
-    
-    def decode(self,z):
-        x = self.fc_dec(z).view(-1,128,8,8,8)
-        return self.decoder(x)
-    
-    def forward(self,x): 
-        raise RuntimeError("Use .encode() only")
+    def device(self):
+        return self._device
+
+    def to(self, device):
+        super().to(device)
+        self._device = device
+        return self
+
+    def encode(self, x):
+        x_enc = self.encoder(x)
+        z = self.fc_mu(x_enc.flatten(1))
+        return z
+
+    def decode(self, z):
+        x = self.fc_dec(z)
+        x = x.view(-1, 128, 8, 8, 8)
+        x = self.decoder(x)
+        return x
+
+    def forward(self, x):
+        return self.decode(self.encode(x))
 
 def load_autoencoder(path:str, device, latent_dim:int=256):
     chk = torch.load(path, map_location=device)
