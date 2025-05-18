@@ -125,18 +125,38 @@ AE_WEIGHTS_SUBNET = Path(r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master t
 
 # best architecture 
 SUB_ARCH = dict(
-    lat_hidden=[196, 215, 44, 414, 36, 240, 82, 127, 23, 215],
-    proc_hidden=[36],
-    fuse_hidden=[274],
+    # Architecture
+    lat_hidden=[105, 32, 48, 81, 510, 326],
+    proc_hidden=[197, 40, 228, 51],
+    fuse_hidden=[289],
+    
+    # Activations
     lat_act="tanh",
     proc_act="tanh",
     fuse_act="selu",
-    lat_drop=0.4138,
-    proc_drop=0.3247,
-    fuse_drop=0.0948,
-    batch_size=26,
-    opt="nadam",
-    lr=0.002188,
+    
+    # Dropout rates
+    lat_drop=0.0193,
+    proc_drop=0.4995,
+    fuse_drop=0.1515,
+    
+    # Training parameters
+    batch_size=28,  
+    
+    # Tower-specific optimizers
+    lat_opt="adagrad",
+    proc_opt="adamax", 
+    fuse_opt="radam",
+    
+    # Tower-specific learning rates
+    lat_lr=0.000341,
+    proc_lr=0.000949,
+    fuse_lr=0.024015,
+    
+    # Tower-specific loss functions
+    lat_loss="huber",
+    proc_loss="smooth_l1",
+    fuse_loss="log_cosh",
 )
 
 PROC_COLS = [
@@ -446,13 +466,70 @@ def run_subnet_cv(k: int = 5):
             fuse_drop=SUB_ARCH["fuse_drop"],
         ).to(DEVICE)
 
-        criterion = nn.MSELoss()
-        if SUB_ARCH["opt"].lower() == "nadam":
-            from torch.optim import Adam
-            optimizer = Adam(model.parameters(), lr=SUB_ARCH["lr"], betas=(0.9, 0.999), weight_decay=1e-5)
-        else:
-            from torch.optim import SGD
-            optimizer = SGD(model.parameters(), lr=SUB_ARCH["lr"], momentum=0.9)
+        # Create per-tower loss functions with more options
+        def make_loss(loss_type):
+            if loss_type.lower() == "mse":
+                return nn.MSELoss()
+            elif loss_type.lower() in ["mae", "l1"]:
+                return nn.L1Loss()
+            elif loss_type.lower() == "huber":
+                return nn.HuberLoss(delta=1.0)
+            elif loss_type.lower() == "smooth_l1":
+                return nn.SmoothL1Loss()
+            elif loss_type.lower() == "log_cosh":
+                # Custom implementation of log-cosh loss
+                def log_cosh_loss(pred, target):
+                    return torch.mean(torch.log(torch.cosh(pred - target)))
+                return log_cosh_loss
+            else:
+                # Default to MSE
+                logger.warning(f"Unknown loss type '{loss_type}', defaulting to MSE")
+                return nn.MSELoss()
+
+        # Create per-tower loss functions
+        lat_criterion = make_loss(SUB_ARCH["lat_loss"])
+        proc_criterion = make_loss(SUB_ARCH["proc_loss"]) 
+        fuse_criterion = make_loss(SUB_ARCH["fuse_loss"])
+
+        # Fixed evaluation metric
+        eval_criterion = nn.MSELoss()
+
+        # Create per-tower optimizers
+        opt_creators = {
+            # Standard optimizers
+            "adagrad": lambda params, lr: torch.optim.Adagrad(params, lr=lr),
+            "adam": lambda params, lr: torch.optim.Adam(params, lr=lr),
+            "adamw": lambda params, lr: torch.optim.AdamW(params, lr=lr),
+            "sgd": lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9),
+            "rmsprop": lambda params, lr: torch.optim.RMSprop(params, lr=lr),
+            
+            # Advanced optimizers with proper implementations
+            "nadam": lambda params, lr: torch.optim.NAdam(params, lr=lr),
+            "radam": lambda params, lr: torch.optim.RAdam(params, lr=lr),
+            "adamax": lambda params, lr: torch.optim.Adamax(params, lr=lr),
+            
+            # Specialized versions
+            "sgd_nesterov": lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9, nesterov=True),
+            "adam_amsgrad": lambda params, lr: torch.optim.Adam(params, lr=lr, amsgrad=True),
+            
+            # Additional options with different default hyperparameters
+            "adam_aggressive": lambda params, lr: torch.optim.Adam(params, lr=lr, betas=(0.8, 0.999)),
+            "adam_conservative": lambda params, lr: torch.optim.Adam(params, lr=lr, betas=(0.9, 0.99)),
+        }
+        lat_optimizer = opt_creators.get(
+            SUB_ARCH["lat_opt"].lower(), 
+            opt_creators["adagrad"]
+        )(model.lat_tower.parameters(), SUB_ARCH["lat_lr"])
+
+        proc_optimizer = opt_creators.get(
+            SUB_ARCH["proc_opt"].lower(), 
+            opt_creators["adagrad"]
+        )(model.proc_tower.parameters(), SUB_ARCH["proc_lr"])
+
+        fuse_optimizer = opt_creators.get(
+            SUB_ARCH["fuse_opt"].lower(), 
+            opt_creators["adagrad"]
+        )([*model.fuse_net.parameters(), *model.out.parameters()], SUB_ARCH["fuse_lr"])
 
         best = float("inf")
         best_target_mses = [float("inf")] * len(TARGET_COLS)
@@ -462,15 +539,45 @@ def run_subnet_cv(k: int = 5):
         for _ in range(500):
             model.train()
             for batch in tr_loader:
-                optimizer.zero_grad()
                 lat_vecs = batch["lat"].to(DEVICE)
                 proc_params = batch["proc"].to(DEVICE)
                 targets = batch["target"].to(DEVICE)
                 
-                pred = model(lat_vecs, proc_params)
-                loss = criterion(pred, targets)
-                loss.backward()
-                optimizer.step()
+                # Update latent tower with its own forward pass
+                lat_optimizer.zero_grad()
+                lat_output = model.lat_tower(lat_vecs)
+                proc_output = model.proc_tower(proc_params)
+                fused = torch.cat([lat_output, proc_output], dim=1)
+                fused_output = model.fuse_net(fused)
+                pred = model.out(fused_output)
+                lat_loss = lat_criterion(pred, targets)
+                lat_loss.backward()  # No retain_graph
+                torch.nn.utils.clip_grad_norm_(model.lat_tower.parameters(), max_norm=1.0)
+                lat_optimizer.step()
+                
+                # Update process tower with a fresh forward pass
+                proc_optimizer.zero_grad()
+                lat_output = model.lat_tower(lat_vecs)
+                proc_output = model.proc_tower(proc_params)
+                fused = torch.cat([lat_output, proc_output], dim=1)
+                fused_output = model.fuse_net(fused)
+                pred = model.out(fused_output)
+                proc_loss = proc_criterion(pred, targets)
+                proc_loss.backward()  # No retain_graph
+                torch.nn.utils.clip_grad_norm_(model.proc_tower.parameters(), max_norm=1.0)
+                proc_optimizer.step()
+                
+                # Update fusion network with a fresh forward pass
+                fuse_optimizer.zero_grad()
+                lat_output = model.lat_tower(lat_vecs)
+                proc_output = model.proc_tower(proc_params)
+                fused = torch.cat([lat_output, proc_output], dim=1)
+                fused_output = model.fuse_net(fused)
+                pred = model.out(fused_output)
+                fuse_loss = fuse_criterion(pred, targets)
+                fuse_loss.backward()
+                torch.nn.utils.clip_grad_norm_([*model.fuse_net.parameters(), *model.out.parameters()], max_norm=1.0)
+                fuse_optimizer.step()
                 
             # validation
             model.eval()
@@ -487,7 +594,7 @@ def run_subnet_cv(k: int = 5):
                     preds = model(lat_vecs, proc_params)
                     
                     # Overall normalized MSE
-                    vals.append(criterion(preds, targets).item())
+                    vals.append(eval_criterion(preds, targets).item())
                     
                     # Per-target normalized MSE
                     target_mses = target_specific_mse(preds, targets)
@@ -607,6 +714,9 @@ def run_thesis_cv(k: int = 5):
             lr=THESIS_ARCH["lr"],
         )
 
+        # Add this line to define the evaluation criterion
+        eval_criterion = nn.MSELoss()  # Fixed evaluation metric for consistent comparison
+
         best = float("inf")
         best_target_mses = [float("inf")] * len(TARGET_COLS)
         best_real_target_mses = [float("inf")] * len(TARGET_COLS)
@@ -638,7 +748,7 @@ def run_thesis_cv(k: int = 5):
                     preds = model(inputs)
                     
                     # Overall normalized MSE
-                    vals.append(nn.MSELoss()(preds, targets).item())  # Always use MSE for evaluation
+                    vals.append(eval_criterion(preds, targets).item())
                     
                     # Per-target normalized MSE
                     target_mses = target_specific_mse(preds, targets)
@@ -780,28 +890,9 @@ if __name__ == "__main__":
         for repeat, fold, score in results:
             write_results_to_file(results_file, f"{repeat:6d} | {fold:4d} | {score:.5f}")
     
-    # Calculate and display final statistics across repeats
-    final_header = "\n\n========== FINAL RESULTS (ACROSS REPEATS) =========="
-    logger.info(final_header)
-    write_results_to_file(results_file, "\n\n" + "="*80)
-    write_results_to_file(results_file, "FINAL RESULTS (ACROSS REPEATS)")
-    write_results_to_file(results_file, "="*80)
-    
-    # Overall results
-    for name, runs in all_results.items():
-        runs = np.array(runs)
-        mean, std = runs.mean(), runs.std()
-        
-        console_msg = f"{name.capitalize():10} →  {mean:.5f} ± {std:.5f} (across {N_REPEATS} repeats)"
-        logger.info(console_msg)
-        
-        file_msg = f"{name.capitalize():10} ->  {mean:.5f} +/- {std:.5f} (across {N_REPEATS} repeats)"
-        write_results_to_file(results_file, file_msg)
-        
-        min_max_msg = f"{' '*12}Min: {runs.min():.5f}, Max: {runs.max():.5f}"
-        logger.info(min_max_msg)
-        write_results_to_file(results_file, min_max_msg)
-    
+    # Skip the overall normalized average results section
+    # and go directly to target-specific results
+
     # Target-specific final results
     write_results_to_file(results_file, "\n\n" + "="*80)
     write_results_to_file(results_file, "TARGET-SPECIFIC RESULTS (NORMALIZED, ACROSS REPEATS)")
