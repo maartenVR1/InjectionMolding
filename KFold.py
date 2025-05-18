@@ -39,15 +39,6 @@ Training becoming unstable after initially working fine
 
 """
 
-"""
-COMPLEXITY OF EACH MODEL;
-
--Benchmark System: 6755 parameters (1 layer, 422 neurons)
--Sub-network system full latent vector: 253.285
--Thesis system full latent vector: 230.683 parameters (3 hidden layers, 411, 163, 327 neurons)
-
-"""
-
 import os
 import json
 from pathlib import Path
@@ -134,18 +125,38 @@ AE_WEIGHTS_SUBNET = Path(r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master t
 
 # best architecture 
 SUB_ARCH = dict(
-    lat_hidden=[196, 215, 44, 414, 36, 240, 82, 127, 23, 215],
-    proc_hidden=[36],
-    fuse_hidden=[274],
+    # Architecture parameters
+    lat_hidden=[105, 32, 48, 81, 510, 326],
+    proc_hidden=[197, 40, 228, 51],
+    fuse_hidden=[289],
+    
+    # Activations
     lat_act="tanh",
     proc_act="tanh",
     fuse_act="selu",
-    lat_drop=0.4138,
-    proc_drop=0.3247,
-    fuse_drop=0.0948,
-    batch_size=26,
-    opt="nadam",
-    lr=0.002188,
+    
+    # Dropout rates
+    lat_drop=0.0193,
+    proc_drop=0.4995,
+    fuse_drop=0.1515,
+    
+    # Per-tower training parameters
+    batch_size=28,  
+    
+    # Tower-specific optimizers
+    lat_opt="adagrad",
+    proc_opt="adamax", 
+    fuse_opt="radam",
+    
+    # Tower-specific learning rates
+    lat_lr=0.000341,
+    proc_lr=0.000949,
+    fuse_lr=0.024015,
+    
+    # Tower-specific loss functions
+    lat_loss="huber",
+    proc_loss="smooth_l1",
+    fuse_loss="log_cosh",
 )
 
 PROC_COLS = [
@@ -181,7 +192,7 @@ THESIS_ARCH = dict(
 )
 
 # --------------------------------------------------------------------------
-# Helper functiosn
+# Helper functions
 # --------------------------------------------------------------------------
 
 def mse(y_hat: torch.Tensor, y: torch.Tensor) -> float:
@@ -216,6 +227,20 @@ def write_results_to_file(filename, message):
     """Append message to the results file"""
     with open(filename, 'a', encoding='utf-8') as f:
         f.write(message + '\n')
+
+
+# Add this helper function to calculate MSE in real units for each target
+def calculate_real_mse(y_hat, y, scaler):
+    """Calculate MSE for predictions in real units (inverse transformed)"""
+    y_hat_real = scaler.inverse_transform(y_hat.cpu().numpy())
+    y_real = scaler.inverse_transform(y.cpu().numpy())
+    
+    # Calculate MSE for each target column
+    mse_per_target = []
+    for i in range(y_real.shape[1]):
+        mse_per_target.append(((y_hat_real[:, i] - y_real[:, i]) ** 2).mean())
+    
+    return mse_per_target
 
 
 # --------------------------------------------------------------------------
@@ -284,19 +309,42 @@ def run_benchmark_cv(k: int = 5):
                 pred = model(batch["input"].to(DEVICE))
                 loss = criterion(pred, batch["target"].to(DEVICE))
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.008) #clip gradients to prevent explosion
+                if isinstance(optimizer, torch.optim.SGD):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             # validation
-            model.eval(); vals=[]
+            model.eval()
+            vals = []  # Keep normalized MSE for training decisions
+            real_vals = [[] for _ in range(len(TARGET_COLS))]  # For real unit MSE per target
+
             with torch.no_grad():
                 for batch in va_loader:
-                    vals.append(criterion(model(batch["input"].to(DEVICE)), batch["target"].to(DEVICE)).item())
+                    inputs = batch["input"].to(DEVICE)
+                    targets = batch["target"].to(DEVICE)
+                    preds = model(inputs)
+                    
+                    # Normalized MSE (for training decisions)
+                    vals.append(criterion(preds, targets).item())
+                    
+                    # Real-unit MSE per target
+                    real_mse = calculate_real_mse(preds, targets, y_scaler)
+                    for i, mse in enumerate(real_mse):
+                        real_vals[i].append(mse)
+
+            # Use normalized MSE for early stopping
             cur = np.mean(vals)
-            if cur < best: best=cur; no_improve=0
+            if cur < best: 
+                best = cur
+                # Store best real MSE values when normalized MSE is best
+                best_real_mse = [np.mean(vals_per_target) for vals_per_target in real_vals]
+                no_improve = 0
             else:
-                no_improve+=1
-                if no_improve>=patience: break
-        logger.info(f"Fold {fold}/{k}  MSE={best:.5f}")
+                no_improve += 1
+                if no_improve >= patience: break
+
+        # Report both normalized and real MSE
+        logger.info(f"Fold {fold}/{k}  MSE={best:.5f} (normalized)")
+        logger.info(f"  Real units: " + " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_mse)]))
         scores.append(best)
         fold_scores.append(best)
     mean_score = np.mean(scores)
@@ -324,8 +372,10 @@ def run_subnet_cv(k: int = 5):
     if rename_map:
         full_df = full_df.rename(columns=rename_map)
     
+    print("About to load autoencoder...")
     ae = load_ae_subnet(str(AE_WEIGHTS_SUBNET), DEVICE, latent_dim=256)
-
+    print("Autoencoder loaded")
+    
     scores = []
     fold_scores = []
     for fold, (tr, va) in enumerate(grouped_kfold_indices(full_df, k), 1):
@@ -361,8 +411,71 @@ def run_subnet_cv(k: int = 5):
             fuse_drop=SUB_ARCH["fuse_drop"],
         ).to(DEVICE)
 
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.NAdam(model.parameters(), lr=SUB_ARCH["lr"])
+        # Create loss functions for each tower
+        def make_loss(loss_type):
+            if loss_type.lower() == "mse":
+                return nn.MSELoss()
+            elif loss_type.lower() in ["mae", "l1"]:
+                return nn.L1Loss()
+            elif loss_type.lower() == "huber":
+                return nn.HuberLoss(delta=1.0)
+            elif loss_type.lower() == "smooth_l1":
+                return nn.SmoothL1Loss()
+            elif loss_type.lower() == "log_cosh":
+                # Custom implementation of log-cosh loss
+                def log_cosh_loss(pred, target):
+                    return torch.mean(torch.log(torch.cosh(pred - target)))
+                return log_cosh_loss
+            else:
+                # Default to MSE
+                logger.warning(f"Unknown loss type '{loss_type}', defaulting to MSE")
+                return nn.MSELoss()
+        
+        lat_criterion = make_loss(SUB_ARCH["lat_loss"])
+        proc_criterion = make_loss(SUB_ARCH["proc_loss"])
+        fuse_criterion = make_loss(SUB_ARCH["fuse_loss"])
+        
+        # Fixed metric for evaluation
+        eval_criterion = nn.MSELoss()  # Always use MSE for evaluation
+
+        # Create optimizer creation function
+        def make_optimizer(opt_type, params, lr):
+            if opt_type.lower() == "adam":
+                return torch.optim.Adam(params, lr=lr)
+            elif opt_type.lower() == "adamw":
+                return torch.optim.AdamW(params, lr=lr)
+            elif opt_type.lower() == "sgd":
+                return torch.optim.SGD(params, lr=lr, momentum=0.9)
+            elif opt_type.lower() == "adagrad":
+                return torch.optim.Adagrad(params, lr=lr)
+            elif opt_type.lower() == "rmsprop":
+                return torch.optim.RMSprop(params, lr=lr)
+            elif opt_type.lower() == "nadam":
+                return torch.optim.NAdam(params, lr=lr)  # Correct implementation
+            elif opt_type.lower() == "radam":
+                return torch.optim.RAdam(params, lr=lr)  # Correct implementation
+            else:
+                logger.warning(f"Unknown optimizer '{opt_type}', defaulting to Adagrad")
+                return torch.optim.Adagrad(params, lr=lr)
+
+        # Create separate optimizers for each tower
+        lat_optimizer = make_optimizer(
+            SUB_ARCH["lat_opt"], 
+            model.lat_tower.parameters(), 
+            SUB_ARCH["lat_lr"]
+        )
+        
+        proc_optimizer = make_optimizer(
+            SUB_ARCH["proc_opt"], 
+            model.proc_tower.parameters(), 
+            SUB_ARCH["proc_lr"]
+        )
+        
+        fuse_optimizer = make_optimizer(
+            SUB_ARCH["fuse_opt"], 
+            [*model.fuse_net.parameters(), *model.out.parameters()], 
+            SUB_ARCH["fuse_lr"]
+        )
 
         best = float("inf")
         patience = 10
@@ -370,31 +483,92 @@ def run_subnet_cv(k: int = 5):
         for _ in range(500):
             model.train()
             for batch in tr_loader:
-                optimizer.zero_grad()
-                pred = model(batch["lat"].to(DEVICE), batch["proc"].to(DEVICE))
-                loss = criterion(pred, batch["target"].to(DEVICE))
-                loss.backward()
+                lat_vecs = batch["lat"].to(DEVICE)
+                proc_params = batch["proc"].to(DEVICE)
+                targets = batch["target"].to(DEVICE)
+                
+                # Forward pass with tower-specific components
+                lat_output = model.lat_tower(lat_vecs)
+                proc_output = model.proc_tower(proc_params)
+                
+                # Concatenate outputs for fusion
+                fused = torch.cat([lat_output, proc_output], dim=1)
+                fused_output = model.fuse_net(fused)
+                pred = model.out(fused_output)
+                
+                # Update latent tower
+                lat_optimizer.zero_grad()
+                lat_output = model.lat_tower(lat_vecs)
+                proc_output = model.proc_tower(proc_params)
+                fused = torch.cat([lat_output, proc_output], dim=1)
+                fused_output = model.fuse_net(fused)
+                pred = model.out(fused_output)
+                lat_loss = lat_criterion(pred, targets)
+                lat_loss.backward()  # No retain_graph
+                torch.nn.utils.clip_grad_norm_(model.lat_tower.parameters(), max_norm=1.0)
+                lat_optimizer.step()
 
-                optimizer.step()
+                # Update process tower with a fresh forward pass
+                proc_optimizer.zero_grad()
+                lat_output = model.lat_tower(lat_vecs)
+                proc_output = model.proc_tower(proc_params)
+                fused = torch.cat([lat_output, proc_output], dim=1)
+                fused_output = model.fuse_net(fused)
+                pred = model.out(fused_output)
+                proc_loss = proc_criterion(pred, targets)
+                proc_loss.backward()  # No retain_graph
+                torch.nn.utils.clip_grad_norm_(model.proc_tower.parameters(), max_norm=1.0)
+                proc_optimizer.step()
+
+                # Update fusion network with a fresh forward pass
+                fuse_optimizer.zero_grad()
+                lat_output = model.lat_tower(lat_vecs)
+                proc_output = model.proc_tower(proc_params)
+                fused = torch.cat([lat_output, proc_output], dim=1)
+                fused_output = model.fuse_net(fused)
+                pred = model.out(fused_output)
+                fuse_loss = fuse_criterion(pred, targets)
+                fuse_loss.backward()
+                torch.nn.utils.clip_grad_norm_([*model.fuse_net.parameters(), *model.out.parameters()], max_norm=1.0)
+                fuse_optimizer.step()
 
             # val
             model.eval()
             vals = []
+            real_vals = [[] for _ in range(len(TARGET_COLS))]
+
             with torch.no_grad():
                 for batch in va_loader:
-                    pred = model(batch["lat"].to(DEVICE), batch["proc"].to(DEVICE))
-                    vals.append(criterion(pred, batch["target"].to(DEVICE)).item())
+                    lat_vecs = batch["lat"].to(DEVICE)
+                    proc_params = batch["proc"].to(DEVICE)
+                    targets = batch["target"].to(DEVICE)
+                    
+                    # Use standard model forward
+                    preds = model(lat_vecs, proc_params)
+                    
+                    # Always use MSE for evaluation
+                    vals.append(eval_criterion(preds, targets).item())
+                    
+                    # Calculate real-unit MSE for reporting
+                    real_mse = calculate_real_mse(preds, targets, scaler_t)
+                    for i, mse in enumerate(real_mse):
+                        real_vals[i].append(mse)
+
             cur = np.mean(vals)
             if cur < best:
                 best = cur
+                best_real_mse = [np.mean(vals_per_target) for vals_per_target in real_vals]
                 no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= patience:
                     break
-        logger.info(f"Fold {fold}/{k}  MSE={best:.5f}")
+                    
+        logger.info(f"Fold {fold}/{k}  MSE={best:.5f} (normalized)")
+        logger.info(f"  Real units: " + " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_mse)]))
         scores.append(best)
         fold_scores.append(best)
+        
     logger.info(f"Sub‑network CV → {np.mean(scores):.5f} ± {np.std(scores):.5f}\n")
     return np.mean(scores), fold_scores
 
@@ -452,21 +626,30 @@ def run_thesis_cv(k: int = 5):
                 loss = criterion(pred, batch["target"].to(DEVICE))
                 loss.backward()
                 
-                # Add gradient clipping (adjust max_norm as needed)
-                #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)   #didnt do anything because network is stable by itself, just like the subnet system
-                
                 optimizer.step()
             # val
-            model.eval(); vals=[]
+            model.eval()
+            vals = []
+            real_vals = [[] for _ in range(len(TARGET_COLS))]
+
             with torch.no_grad():
                 for batch in va_loader:
-                    vals.append(criterion(model(batch["input"].to(DEVICE)), batch["target"].to(DEVICE)).item())
+                    preds = model(batch["input"].to(DEVICE))
+                    vals.append(criterion(preds, batch["target"].to(DEVICE)).item())
+                    real_mse = calculate_real_mse(preds, batch["target"], scaler_t)
+                    for i, mse in enumerate(real_mse):
+                        real_vals[i].append(mse)
+
             cur=np.mean(vals)
-            if cur<best: best=cur; no_improve=0
+            if cur<best: 
+                best=cur
+                best_real_mse = [np.mean(vals_per_target) for vals_per_target in real_vals]
+                no_improve=0
             else:
                 no_improve+=1
                 if no_improve>=patience: break
-        logger.info(f"Fold {fold}/{k}  MSE={best:.5f}")
+        logger.info(f"Fold {fold}/{k}  MSE={best:.5f} (normalized)")
+        logger.info(f"  Real units: " + " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_mse)]))
         scores.append(best)
         fold_scores.append(best)
     logger.info(f"Thesis system CV → {np.mean(scores):.5f} ± {np.std(scores):.5f}\n")
@@ -477,6 +660,7 @@ def run_thesis_cv(k: int = 5):
 # Main entry
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
+    print("Script starting...")
     # Create a timestamped results file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_file = f"kfold_results_{timestamp}.txt"
