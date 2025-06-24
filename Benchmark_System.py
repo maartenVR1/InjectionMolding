@@ -12,6 +12,19 @@ from sklearn.model_selection import train_test_split
 import pandas as pd
 import logging
 
+"""
+This code only works when the training data is stored in a specific format:
+
+TrainingData_Benchmark_System/
+├── product1/
+│   ├── product1.xlsx
+├── product2/
+│   ├── product2.xlsx
+└── product3/
+    ├── product3.xlsx
+
+"""
+
 # logging for debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -62,7 +75,7 @@ class BenchmarkDataset(Dataset):
     def __len__(self):
         return len(self.data)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx): # just a standard dataset method to get an item by index
         input_features = self.inputs[idx]
         target = self.targets[idx]
         
@@ -82,7 +95,7 @@ class MLPBenchmarkModel(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         
-        # Set up activation function
+        # Set up activation function, selected the most frequently used ones, u can extend this if you want to test more
         if activation_fn == 'relu':
             activation = nn.ReLU()
         elif activation_fn == 'leaky_relu':
@@ -99,7 +112,7 @@ class MLPBenchmarkModel(nn.Module):
         # Build the network layer by layer in a list
         layers = []
         
-        # Input layer
+        # Input layer, this is a way to dynamically set the number of layers and its neurons per layer
         input_size = input_dim
         for i in range(hidden_layers):
             layers.append(nn.Linear(input_size, neurons_per_layer[i]))
@@ -112,7 +125,7 @@ class MLPBenchmarkModel(nn.Module):
         # Output layer
         layers.append(nn.Linear(input_size, output_dim))
         
-        self.model = nn.Sequential(*layers) #* unpacks the list of layers into the constructor of nn.Sequential
+        self.model = nn.Sequential(*layers) #* unpacks the list of layers into the constructor of nn.Sequential, u dont wnant a list
     
     def forward(self, x): 
         return self.model(x) # the model method comes from nn.Sequential, which is a container for the layers
@@ -120,7 +133,7 @@ class MLPBenchmarkModel(nn.Module):
 
 class BenchmarkTrainer:
     """
-    Trainer class for the benchmark MLP model with Optuna hyperparameter optimization.
+    Trainer class for the benchmark MLP model with Optuna hyperparameter optimization. This is the main class with a tonne of helper functions for clarity.
     """
     def __init__(self, 
                  main_folder,
@@ -179,22 +192,22 @@ class BenchmarkTrainer:
         val_data = data[data["product_name"].isin(product_split["val_products"])].reset_index(drop=True)
         test_data = data[data["product_name"].isin(product_split["test_products"])].reset_index(drop=True)
         
-        # Save split datasets
+        # Save split datasets, just for dubble checks
         train_csv_path = os.path.join(self.output_dir, 'benchmark_train_data.csv') 
         train_data.to_csv(train_csv_path, index=False)
         val_csv_path = os.path.join(self.output_dir, 'benchmark_val_data.csv')
         val_data.to_csv(val_csv_path, index=False)
         test_csv_path = os.path.join(self.output_dir, 'benchmark_test_data.csv')
         test_data.to_csv(test_csv_path, index=False)
-        
-        # trainin data scaler
+
+        # training data scaler, normalization of input features and target values
         self.input_scaler = StandardScaler()
         self.input_scaler.fit(train_data[self.input_columns])
         
         # Division by zer handling (gate location is constant)
         self.input_scaler.scale_[self.input_scaler.scale_ == 0] = 1.0
 
-        # scaler for target values
+        # scaler for target values, u could also not normlalize these targets but i think taht would be a bad idea
         self.target_scaler = StandardScaler()
         self.target_scaler.fit(train_data[self.target_columns])
         
@@ -265,7 +278,7 @@ class BenchmarkTrainer:
         activation = trial.suggest_categorical('activation', 
                                               ['relu', 'leaky_relu', 'elu', 'tanh', 'selu'])
         
-        # Suggest dropout rate
+        # Suggest dropout rate, could increase this range
         dropout = trial.suggest_float('dropout', 0.0, 0.5)
         
         # Create model
@@ -330,9 +343,9 @@ class BenchmarkTrainer:
                 return torch.mean(torch.log(torch.cosh(input - target)))
             criterion = log_cosh_loss
             
-        # Add a consistent validation metric
-        fixed_validation_metric = nn.MSELoss()  # Always use MSE for validation, like otther systems as well
-        
+        # Add a consistent validation metric, different from the training loss
+        fixed_validation_metric = nn.MSELoss()  # Always use MSE for validation, like other systems as well
+
         num_epochs = 250
         patience = 25 
         
@@ -365,7 +378,7 @@ class BenchmarkTrainer:
             # Validation phase, this code does validate 
             # the network on the validation set and uses that validation performance to guide hyperparameter selection through Optuna
             model.eval()
-            validation_loss_sum = 0.0  # Renamed from val_loss
+            validation_loss_sum = 0.0  
             
             with torch.no_grad():
                 for batch in self.val_loader:
@@ -696,5 +709,5 @@ if __name__ == "__main__":
         study_name='benchmark_quality_prediction'
     )
     
-    # Run optimization
+    # Run optimization using Optuna
     best_model, study = trainer.optimize()
