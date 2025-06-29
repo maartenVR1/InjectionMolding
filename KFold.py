@@ -125,7 +125,7 @@ AE_WEIGHTS_SUBNET = Path(r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master t
 
 # best architecture 
 SUB_ARCH = dict(
-    # Architecture parameters
+    # Architecture
     lat_hidden=[105, 32, 48, 81, 510, 326],
     proc_hidden=[197, 40, 228, 51],
     fuse_hidden=[289],
@@ -140,7 +140,7 @@ SUB_ARCH = dict(
     proc_drop=0.4995,
     fuse_drop=0.1515,
     
-    # Per-tower training parameters
+    # Training parameters
     batch_size=28,  
     
     # Tower-specific optimizers
@@ -198,6 +198,32 @@ THESIS_ARCH = dict(
 def mse(y_hat: torch.Tensor, y: torch.Tensor) -> float:
     return nn.MSELoss()(y_hat, y).item()
 
+# Add this helper function to calculate MSE for each target separately
+def target_specific_mse(y_hat: torch.Tensor, y: torch.Tensor) -> List[float]:
+    """Calculate MSE for each target dimension separately."""
+    mse_per_target = []
+    for i in range(y.shape[1]):  # For each target dimension
+        mse_per_target.append(nn.MSELoss()(y_hat[:, i], y[:, i]).item())
+    return mse_per_target
+
+# Add this helper function to calculate MSE in real units
+def calculate_real_mse(y_hat: torch.Tensor, y: torch.Tensor, scaler) -> List[float]:
+    """Calculate MSE for each target in real units (inverse transformed)"""
+    # Convert to numpy and apply inverse transform
+    y_hat_np = y_hat.detach().cpu().numpy()
+    y_np = y.detach().cpu().numpy()
+    
+    # Inverse transform to get real units
+    y_hat_real = scaler.inverse_transform(y_hat_np)
+    y_real = scaler.inverse_transform(y_np)
+    
+    # Calculate MSE per target column
+    real_mse_per_target = []
+    for i in range(y_real.shape[1]):
+        mse = ((y_hat_real[:, i] - y_real[:, i]) ** 2).mean()
+        real_mse_per_target.append(mse)
+    
+    return real_mse_per_target
 
 def grouped_kfold_indices(df: pd.DataFrame, n_splits: int = 5):
     gkf = GroupKFold(n_splits=n_splits)
@@ -229,20 +255,6 @@ def write_results_to_file(filename, message):
         f.write(message + '\n')
 
 
-# Add this helper function to calculate MSE in real units for each target
-def calculate_real_mse(y_hat, y, scaler):
-    """Calculate MSE for predictions in real units (inverse transformed)"""
-    y_hat_real = scaler.inverse_transform(y_hat.cpu().numpy())
-    y_real = scaler.inverse_transform(y.cpu().numpy())
-    
-    # Calculate MSE for each target column
-    mse_per_target = []
-    for i in range(y_real.shape[1]):
-        mse_per_target.append(((y_hat_real[:, i] - y_real[:, i]) ** 2).mean())
-    
-    return mse_per_target
-
-
 # --------------------------------------------------------------------------
 # 1. BENCHMARK Cross validaiton
 # --------------------------------------------------------------------------
@@ -260,6 +272,10 @@ def run_benchmark_cv(k: int = 5):
 
     scores = []
     fold_scores = []
+    # Create lists for each target
+    target_scores = [[] for _ in range(len(TARGET_COLS))]
+    real_target_scores = [[] for _ in range(len(TARGET_COLS))]
+    
     for fold, (tr, va) in enumerate(grouped_kfold_indices(full_df, k), 1):
         tr_df, va_df = full_df.iloc[tr].reset_index(drop=True), full_df.iloc[va].reset_index(drop=True)
         
@@ -268,7 +284,7 @@ def run_benchmark_cv(k: int = 5):
         logger.info(f"Fold {fold} validation products: {val_products}")
 
         x_scaler = StandardScaler().fit(tr_df[INPUT_COLS_BENCH])
-        x_scaler.scale_[x_scaler.scale_ == 0] = 1.0  # Add this protection line
+        x_scaler.scale_[x_scaler.scale_ == 0] = 1.0
         y_scaler = StandardScaler().fit(tr_df[TARGET_COLS])
         y_scaler.scale_[y_scaler.scale_ == 0] = 1.0
 
@@ -281,7 +297,7 @@ def run_benchmark_cv(k: int = 5):
                 TARGET_COLS, 
                 transform=x_scaler,
                 target_transform=y_scaler, 
-                fit_transform=False  # Always False - we've already fitted above
+                fit_transform=False
             )
             os.remove(tmp_csv)
             return ds
@@ -301,83 +317,108 @@ def run_benchmark_cv(k: int = 5):
         criterion = nn.MSELoss()
         optimizer = torch.optim.SGD(model.parameters(), lr=BEST_BENCHMARK["lr"], momentum=0.9)
 
-        best = float("inf"); patience=10; no_improve=0
+        best = float("inf")
+        best_target_mses = [float("inf")] * len(TARGET_COLS)
+        best_real_target_mses = [float("inf")] * len(TARGET_COLS)
+        patience=10; no_improve=0
         for _ in range(500):
             model.train()
             for batch in tr_loader:
                 optimizer.zero_grad()
-                pred = model(batch["input"].to(DEVICE))
-                loss = criterion(pred, batch["target"].to(DEVICE))
+                inputs = batch["input"].to(DEVICE)
+                targets = batch["target"].to(DEVICE)
+                
+                pred = model(inputs)
+                loss = criterion(pred, targets)
                 loss.backward()
                 if isinstance(optimizer, torch.optim.SGD):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                
             # validation
             model.eval()
             vals = []  # Keep normalized MSE for training decisions
-            real_vals = [[] for _ in range(len(TARGET_COLS))]  # For real unit MSE per target
-
+            target_vals = [[] for _ in range(len(TARGET_COLS))]  # Normalized MSE per target
+            real_vals = [[] for _ in range(len(TARGET_COLS))]  # Real unit MSE per target
+            
             with torch.no_grad():
                 for batch in va_loader:
                     inputs = batch["input"].to(DEVICE)
                     targets = batch["target"].to(DEVICE)
                     preds = model(inputs)
                     
-                    # Normalized MSE (for training decisions)
+                    # Overall normalized MSE
                     vals.append(criterion(preds, targets).item())
                     
+                    # Per-target normalized MSE
+                    target_mses = target_specific_mse(preds, targets)
+                    for i, mse in enumerate(target_mses):
+                        target_vals[i].append(mse)
+                    
                     # Real-unit MSE per target
-                    real_mse = calculate_real_mse(preds, targets, y_scaler)
-                    for i, mse in enumerate(real_mse):
+                    real_target_mses = calculate_real_mse(preds, targets, y_scaler)
+                    for i, mse in enumerate(real_target_mses):
                         real_vals[i].append(mse)
-
-            # Use normalized MSE for early stopping
+            
+            # Calculate mean MSE (normalized and real)
             cur = np.mean(vals)
-            if cur < best: 
+            norm_target_means = [np.mean(t_vals) for t_vals in target_vals]
+            real_target_means = [np.mean(r_vals) for r_vals in real_vals]
+            
+            # Track best performance (using normalized MSE for decision)
+            if cur < best:
                 best = cur
-                # Store best real MSE values when normalized MSE is best
-                best_real_mse = [np.mean(vals_per_target) for vals_per_target in real_vals]
+                best_target_mses = norm_target_means  # normalized MSE per target
+                best_real_target_mses = real_target_means  # real unit MSE per target
                 no_improve = 0
             else:
                 no_improve += 1
-                if no_improve >= patience: break
-
-        # Report both normalized and real MSE
+                if no_improve >= patience:
+                    break
+                    
         logger.info(f"Fold {fold}/{k}  MSE={best:.5f} (normalized)")
-        logger.info(f"  Real units: " + " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_mse)]))
+        logger.info(f"Real units MSE: " + 
+                   " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_target_mses)]))
+        
         scores.append(best)
         fold_scores.append(best)
+        
+        # Add target-specific scores
+        for i, mse in enumerate(best_target_mses):
+            target_scores[i].append(mse)
+        for i, mse in enumerate(best_real_target_mses):
+            real_target_scores[i].append(mse)
+    
+    # Overall results
     mean_score = np.mean(scores)
     std_score = np.std(scores)
-    logger.info(f"Benchmark CV →  {mean_score:.5f} ± {std_score:.5f}\n")
-    return mean_score, scores  # Return both mean and individual fold scores
-
+    logger.info(f"Benchmark CV →  {mean_score:.5f} ± {std_score:.5f}")
+    
+    # Target-specific results
+    for i, target in enumerate(TARGET_COLS):
+        target_mean = np.mean(target_scores[i])
+        target_std = np.std(target_scores[i])
+        logger.info(f"  {target} →  {target_mean:.5f} ± {target_std:.5f}")
+        
+    logger.info("")
+    
+    return mean_score, fold_scores, target_scores, real_target_scores
 
 # --------------------------------------------------------------------------
-# 2. SUB‑NETWORK CV
+# 2. SUB-NETWORK Cross validation 
 # --------------------------------------------------------------------------
-
 def run_subnet_cv(k: int = 5):
-    logger.info("=== SUB‑NETWORK SYSTEM ===")
-    
-    # Load dataframe and print column names for debugging
+    logger.info("\n=== SUB-NETWORK SYSTEM ===")
     full_df = load_product_dataframe(MAIN_FOLDER_SUBNET)
-    logger.info(f"Available columns: {full_df.columns.tolist()}")
-    
-    # Fix column name mapping if needed
-    rename_map = {}
-    if 'Packing pressure' in full_df.columns:  # lowercase 'p'
-        rename_map['Packing pressure'] = 'Packing Pressure'
-    
-    if rename_map:
-        full_df = full_df.rename(columns=rename_map)
-    
-    print("About to load autoencoder...")
-    ae = load_ae_subnet(str(AE_WEIGHTS_SUBNET), DEVICE, latent_dim=256)
-    print("Autoencoder loaded")
-    
+
     scores = []
     fold_scores = []
+    # Create lists for each target
+    target_scores = [[] for _ in range(len(TARGET_COLS))]
+    real_target_scores = [[] for _ in range(len(TARGET_COLS))]
+    
+    encoder = load_ae_subnet(str(AE_WEIGHTS_SUBNET), DEVICE, latent_dim=256)
+    
     for fold, (tr, va) in enumerate(grouped_kfold_indices(full_df, k), 1):
         tr_df, va_df = full_df.iloc[tr].reset_index(drop=True), full_df.iloc[va].reset_index(drop=True)
         
@@ -385,20 +426,34 @@ def run_subnet_cv(k: int = 5):
         val_products = sorted(va_df["product_name"].unique())
         logger.info(f"Fold {fold} validation products: {val_products}")
 
-        scaler_p = StandardScaler().fit(tr_df[PROC_COLS])
-        scaler_p.scale_[scaler_p.scale_ == 0] = 1.0
-        scaler_t = StandardScaler().fit(tr_df[TARGET_COLS])
-        scaler_t.scale_[scaler_t.scale_==0]=1.0
+        # Scale process inputs
+        p_scaler = StandardScaler().fit(tr_df[PROC_COLS])
+        p_scaler.scale_[p_scaler.scale_ == 0] = 1.0
+        
+        # Scale targets
+        y_scaler = StandardScaler().fit(tr_df[TARGET_COLS])
+        y_scaler.scale_[y_scaler.scale_ == 0] = 1.0
 
-        def make_loader(df, fit, bs, shuffle):
-            ds = SubnetDataset(df, MAIN_FOLDER_SUBNET, ae, PROC_COLS, TARGET_COLS, scaler_p, scaler_t, DEVICE)
-            return DataLoader(ds, batch_size=bs, shuffle=shuffle)
+        def make_ds(df, is_train):
+            return SubnetDataset(
+                df,                      # DataFrame directly
+                MAIN_FOLDER_SUBNET,      # Root folder path
+                encoder,                 # Encoder model
+                PROC_COLS,               # Process columns
+                TARGET_COLS,             # Target columns
+                p_scaler,                # Process scaler
+                y_scaler,                # Target scaler
+                DEVICE                   # Device
+            )
 
-        tr_loader = make_loader(tr_df, True, SUB_ARCH["batch_size"], True)
-        va_loader = make_loader(va_df, False, SUB_ARCH["batch_size"], False)
+        tr_ds = make_ds(tr_df, True)
+        va_ds = make_ds(va_df, False)
+        
+        tr_loader = DataLoader(tr_ds, batch_size=SUB_ARCH["batch_size"], shuffle=True)
+        va_loader = DataLoader(va_ds, batch_size=SUB_ARCH["batch_size"], shuffle=False)
 
         model = HierarchicalQualityPredictor(
-            latent_dim=ae.fc_mu.out_features,
+            latent_dim=encoder.fc_mu.out_features,
             proc_dim=len(PROC_COLS),
             lat_hidden=SUB_ARCH["lat_hidden"],
             proc_hidden=SUB_ARCH["proc_hidden"],
@@ -411,7 +466,7 @@ def run_subnet_cv(k: int = 5):
             fuse_drop=SUB_ARCH["fuse_drop"],
         ).to(DEVICE)
 
-        # Create loss functions for each tower
+        # Create per-tower loss functions with more options
         def make_loss(loss_type):
             if loss_type.lower() == "mse":
                 return nn.MSELoss()
@@ -430,56 +485,57 @@ def run_subnet_cv(k: int = 5):
                 # Default to MSE
                 logger.warning(f"Unknown loss type '{loss_type}', defaulting to MSE")
                 return nn.MSELoss()
-        
+
+        # Create per-tower loss functions
         lat_criterion = make_loss(SUB_ARCH["lat_loss"])
-        proc_criterion = make_loss(SUB_ARCH["proc_loss"])
+        proc_criterion = make_loss(SUB_ARCH["proc_loss"]) 
         fuse_criterion = make_loss(SUB_ARCH["fuse_loss"])
-        
-        # Fixed metric for evaluation
-        eval_criterion = nn.MSELoss()  # Always use MSE for evaluation
 
-        # Create optimizer creation function
-        def make_optimizer(opt_type, params, lr):
-            if opt_type.lower() == "adam":
-                return torch.optim.Adam(params, lr=lr)
-            elif opt_type.lower() == "adamw":
-                return torch.optim.AdamW(params, lr=lr)
-            elif opt_type.lower() == "sgd":
-                return torch.optim.SGD(params, lr=lr, momentum=0.9)
-            elif opt_type.lower() == "adagrad":
-                return torch.optim.Adagrad(params, lr=lr)
-            elif opt_type.lower() == "rmsprop":
-                return torch.optim.RMSprop(params, lr=lr)
-            elif opt_type.lower() == "nadam":
-                return torch.optim.NAdam(params, lr=lr)  # Correct implementation
-            elif opt_type.lower() == "radam":
-                return torch.optim.RAdam(params, lr=lr)  # Correct implementation
-            else:
-                logger.warning(f"Unknown optimizer '{opt_type}', defaulting to Adagrad")
-                return torch.optim.Adagrad(params, lr=lr)
+        # Fixed evaluation metric
+        eval_criterion = nn.MSELoss()
 
-        # Create separate optimizers for each tower
-        lat_optimizer = make_optimizer(
-            SUB_ARCH["lat_opt"], 
-            model.lat_tower.parameters(), 
-            SUB_ARCH["lat_lr"]
-        )
-        
-        proc_optimizer = make_optimizer(
-            SUB_ARCH["proc_opt"], 
-            model.proc_tower.parameters(), 
-            SUB_ARCH["proc_lr"]
-        )
-        
-        fuse_optimizer = make_optimizer(
-            SUB_ARCH["fuse_opt"], 
-            [*model.fuse_net.parameters(), *model.out.parameters()], 
-            SUB_ARCH["fuse_lr"]
-        )
+        # Create per-tower optimizers
+        opt_creators = {
+            # Standard optimizers
+            "adagrad": lambda params, lr: torch.optim.Adagrad(params, lr=lr),
+            "adam": lambda params, lr: torch.optim.Adam(params, lr=lr),
+            "adamw": lambda params, lr: torch.optim.AdamW(params, lr=lr),
+            "sgd": lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9),
+            "rmsprop": lambda params, lr: torch.optim.RMSprop(params, lr=lr),
+            
+            # Advanced optimizers with proper implementations
+            "nadam": lambda params, lr: torch.optim.NAdam(params, lr=lr),
+            "radam": lambda params, lr: torch.optim.RAdam(params, lr=lr),
+            "adamax": lambda params, lr: torch.optim.Adamax(params, lr=lr),
+            
+            # Specialized versions
+            "sgd_nesterov": lambda params, lr: torch.optim.SGD(params, lr=lr, momentum=0.9, nesterov=True),
+            "adam_amsgrad": lambda params, lr: torch.optim.Adam(params, lr=lr, amsgrad=True),
+            
+            # Additional options with different default hyperparameters
+            "adam_aggressive": lambda params, lr: torch.optim.Adam(params, lr=lr, betas=(0.8, 0.999)),
+            "adam_conservative": lambda params, lr: torch.optim.Adam(params, lr=lr, betas=(0.9, 0.99)),
+        }
+        lat_optimizer = opt_creators.get(
+            SUB_ARCH["lat_opt"].lower(), 
+            opt_creators["adagrad"]
+        )(model.lat_tower.parameters(), SUB_ARCH["lat_lr"])
+
+        proc_optimizer = opt_creators.get(
+            SUB_ARCH["proc_opt"].lower(), 
+            opt_creators["adagrad"]
+        )(model.proc_tower.parameters(), SUB_ARCH["proc_lr"])
+
+        fuse_optimizer = opt_creators.get(
+            SUB_ARCH["fuse_opt"].lower(), 
+            opt_creators["adagrad"]
+        )([*model.fuse_net.parameters(), *model.out.parameters()], SUB_ARCH["fuse_lr"])
 
         best = float("inf")
-        patience = 10
-        no_improve = 0
+        best_target_mses = [float("inf")] * len(TARGET_COLS)
+        best_real_target_mses = [float("inf")] * len(TARGET_COLS)
+        patience=15; no_improve=0
+        
         for _ in range(500):
             model.train()
             for batch in tr_loader:
@@ -487,16 +543,7 @@ def run_subnet_cv(k: int = 5):
                 proc_params = batch["proc"].to(DEVICE)
                 targets = batch["target"].to(DEVICE)
                 
-                # Forward pass with tower-specific components
-                lat_output = model.lat_tower(lat_vecs)
-                proc_output = model.proc_tower(proc_params)
-                
-                # Concatenate outputs for fusion
-                fused = torch.cat([lat_output, proc_output], dim=1)
-                fused_output = model.fuse_net(fused)
-                pred = model.out(fused_output)
-                
-                # Update latent tower
+                # Update latent tower with its own forward pass
                 lat_optimizer.zero_grad()
                 lat_output = model.lat_tower(lat_vecs)
                 proc_output = model.proc_tower(proc_params)
@@ -507,7 +554,7 @@ def run_subnet_cv(k: int = 5):
                 lat_loss.backward()  # No retain_graph
                 torch.nn.utils.clip_grad_norm_(model.lat_tower.parameters(), max_norm=1.0)
                 lat_optimizer.step()
-
+                
                 # Update process tower with a fresh forward pass
                 proc_optimizer.zero_grad()
                 lat_output = model.lat_tower(lat_vecs)
@@ -519,7 +566,7 @@ def run_subnet_cv(k: int = 5):
                 proc_loss.backward()  # No retain_graph
                 torch.nn.utils.clip_grad_norm_(model.proc_tower.parameters(), max_norm=1.0)
                 proc_optimizer.step()
-
+                
                 # Update fusion network with a fresh forward pass
                 fuse_optimizer.zero_grad()
                 lat_output = model.lat_tower(lat_vecs)
@@ -531,33 +578,44 @@ def run_subnet_cv(k: int = 5):
                 fuse_loss.backward()
                 torch.nn.utils.clip_grad_norm_([*model.fuse_net.parameters(), *model.out.parameters()], max_norm=1.0)
                 fuse_optimizer.step()
-
-            # val
+                
+            # validation
             model.eval()
-            vals = []
-            real_vals = [[] for _ in range(len(TARGET_COLS))]
-
+            vals = []  # Keep normalized MSE for training decisions
+            target_vals = [[] for _ in range(len(TARGET_COLS))]  # Normalized MSE per target
+            real_vals = [[] for _ in range(len(TARGET_COLS))]  # Real unit MSE per target
+            
             with torch.no_grad():
                 for batch in va_loader:
                     lat_vecs = batch["lat"].to(DEVICE)
                     proc_params = batch["proc"].to(DEVICE)
                     targets = batch["target"].to(DEVICE)
                     
-                    # Use standard model forward
                     preds = model(lat_vecs, proc_params)
                     
-                    # Always use MSE for evaluation
+                    # Overall normalized MSE
                     vals.append(eval_criterion(preds, targets).item())
                     
-                    # Calculate real-unit MSE for reporting
-                    real_mse = calculate_real_mse(preds, targets, scaler_t)
-                    for i, mse in enumerate(real_mse):
+                    # Per-target normalized MSE
+                    target_mses = target_specific_mse(preds, targets)
+                    for i, mse in enumerate(target_mses):
+                        target_vals[i].append(mse)
+                    
+                    # Real-unit MSE per target
+                    real_target_mses = calculate_real_mse(preds, targets, y_scaler)
+                    for i, mse in enumerate(real_target_mses):
                         real_vals[i].append(mse)
-
+            
+            # Calculate mean MSE (normalized and real)
             cur = np.mean(vals)
+            norm_target_means = [np.mean(t_vals) for t_vals in target_vals]
+            real_target_means = [np.mean(r_vals) for r_vals in real_vals]
+            
+            # Track best performance (using normalized MSE for decision)
             if cur < best:
                 best = cur
-                best_real_mse = [np.mean(vals_per_target) for vals_per_target in real_vals]
+                best_target_mses = norm_target_means 
+                best_real_target_mses = real_target_means
                 no_improve = 0
             else:
                 no_improve += 1
@@ -565,48 +623,83 @@ def run_subnet_cv(k: int = 5):
                     break
                     
         logger.info(f"Fold {fold}/{k}  MSE={best:.5f} (normalized)")
-        logger.info(f"  Real units: " + " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_mse)]))
+        logger.info(f"Real units MSE: " + 
+                   " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_target_mses)]))
+        
         scores.append(best)
         fold_scores.append(best)
         
-    logger.info(f"Sub‑network CV → {np.mean(scores):.5f} ± {np.std(scores):.5f}\n")
-    return np.mean(scores), fold_scores
-
-
-# --------------------------------------------------------------------------
-# 3. THESIS / NORMAL SYSTEM CV
-# --------------------------------------------------------------------------
-
-def run_thesis_cv(k: int = 5):
-    logger.info("=== THESIS / NORMAL SYSTEM ===")
-    # Use the same shared loading function
-    full_df = load_product_dataframe(MAIN_FOLDER_THESIS)
+        # Add target-specific scores
+        for i, mse in enumerate(best_target_mses):
+            target_scores[i].append(mse)
+        for i, mse in enumerate(best_real_target_mses):
+            real_target_scores[i].append(mse)
     
-    ae = load_ae_thesis(str(AE_WEIGHTS_THESIS), DEVICE, latent_dim=256)
+    # Overall results
+    mean_score = np.mean(scores)
+    std_score = np.std(scores)
+    logger.info(f"SubNetwork CV →  {mean_score:.5f} ± {std_score:.5f}")
+    
+    # Target-specific results
+    for i, target in enumerate(TARGET_COLS):
+        target_mean = np.mean(target_scores[i])
+        target_std = np.std(target_scores[i])
+        logger.info(f"  {target} →  {target_mean:.5f} ± {target_std:.5f}")
+        
+    logger.info("")
+    
+    return mean_score, fold_scores, target_scores, real_target_scores
 
-    scores=[]
+# --------------------------------------------------------------------------
+# 3. THESIS SYSTEM Cross validation
+# --------------------------------------------------------------------------
+def run_thesis_cv(k: int = 5):
+    logger.info("\n=== THESIS SYSTEM ===")
+    full_df = load_product_dataframe(MAIN_FOLDER_THESIS)
+
+    scores = []
     fold_scores = []
-    for fold,(tr,va) in enumerate(grouped_kfold_indices(full_df,k),1):
+    # Create lists for each target
+    target_scores = [[] for _ in range(len(TARGET_COLS))]
+    real_target_scores = [[] for _ in range(len(TARGET_COLS))]
+    
+    encoder = load_ae_subnet(str(AE_WEIGHTS_SUBNET), DEVICE, latent_dim=256)
+    
+    for fold, (tr, va) in enumerate(grouped_kfold_indices(full_df, k), 1):
         tr_df, va_df = full_df.iloc[tr].reset_index(drop=True), full_df.iloc[va].reset_index(drop=True)
         
         # Print validation fold products
         val_products = sorted(va_df["product_name"].unique())
         logger.info(f"Fold {fold} validation products: {val_products}")
 
-        scaler_p = StandardScaler().fit(tr_df[PROC_COLS])
-        scaler_p.scale_[scaler_p.scale_ == 0] = 1.0
-        scaler_t = StandardScaler().fit(tr_df[TARGET_COLS])
-        scaler_t.scale_[scaler_t.scale_==0]=1.0
+        # Scale process inputs 
+        p_scaler = StandardScaler().fit(tr_df[PROC_COLS])
+        p_scaler.scale_[p_scaler.scale_ == 0] = 1.0
+        
+        # Scale targets
+        y_scaler = StandardScaler().fit(tr_df[TARGET_COLS])
+        y_scaler.scale_[y_scaler.scale_ == 0] = 1.0
 
-        def make_loader(df, bs, shuffle):
-            ds = ThesisDataset(df, MAIN_FOLDER_THESIS, ae, PROC_COLS, TARGET_COLS, scaler_p, scaler_t, DEVICE)
-            return DataLoader(ds, batch_size=bs, shuffle=shuffle)
+        def make_ds(df, is_train):
+            return ThesisDataset(
+                df,                      # DataFrame directly
+                MAIN_FOLDER_THESIS,      # Root folder path
+                encoder,                 # Encoder model
+                PROC_COLS,               # Process columns
+                TARGET_COLS,             # Target columns
+                p_scaler,                # Process scaler
+                y_scaler,                # Target scaler
+                DEVICE                   # Device
+            )
 
-        tr_loader = make_loader(tr_df, THESIS_ARCH["batch_size"], True)
-        va_loader = make_loader(va_df, THESIS_ARCH["batch_size"], False)
+        tr_ds = make_ds(tr_df, True)
+        va_ds = make_ds(va_df, False)
+        
+        tr_loader = DataLoader(tr_ds, batch_size=THESIS_ARCH["batch_size"], shuffle=True)
+        va_loader = DataLoader(va_ds, batch_size=THESIS_ARCH["batch_size"], shuffle=False)
 
         model = MLPQualityPredictor(
-            input_dim=ae.fc_mu.out_features + len(PROC_COLS),
+            input_dim=encoder.fc_mu.out_features + len(PROC_COLS),
             output_dim=len(TARGET_COLS),
             hidden_layers=THESIS_ARCH["hidden_layers"],
             neurons_per_layer=THESIS_ARCH["neurons"],
@@ -615,52 +708,106 @@ def run_thesis_cv(k: int = 5):
         ).to(DEVICE)
 
         criterion = make_loss_thesis(THESIS_ARCH["loss_fn"])
-        optimizer = make_opt_thesis(THESIS_ARCH["opt"], model.parameters(), THESIS_ARCH["lr"])
+        optimizer = make_opt_thesis(
+            THESIS_ARCH["opt"],
+            model.parameters(),
+            lr=THESIS_ARCH["lr"],
+        )
 
-        best=float("inf"); patience=10; no_improve=0
+        # Add this line to define the evaluation criterion
+        eval_criterion = nn.MSELoss()  # Fixed evaluation metric for consistent comparison
+
+        best = float("inf")
+        best_target_mses = [float("inf")] * len(TARGET_COLS)
+        best_real_target_mses = [float("inf")] * len(TARGET_COLS)
+        patience=15; no_improve=0
+        
         for _ in range(500):
             model.train()
             for batch in tr_loader:
                 optimizer.zero_grad()
-                pred = model(batch["input"].to(DEVICE))
-                loss = criterion(pred, batch["target"].to(DEVICE))
-                loss.backward()
+                inputs = batch["input"].to(DEVICE)
+                targets = batch["target"].to(DEVICE)
                 
+                pred = model(inputs)
+                loss = criterion(pred, targets)
+                loss.backward()
                 optimizer.step()
-            # val
+                
+            # validation
             model.eval()
-            vals = []
-            real_vals = [[] for _ in range(len(TARGET_COLS))]
-
+            vals = []  # Keep normalized MSE for training decisions
+            target_vals = [[] for _ in range(len(TARGET_COLS))]  # Normalized MSE per target
+            real_vals = [[] for _ in range(len(TARGET_COLS))]  # Real unit MSE per target
+            
             with torch.no_grad():
                 for batch in va_loader:
-                    preds = model(batch["input"].to(DEVICE))
-                    vals.append(criterion(preds, batch["target"].to(DEVICE)).item())
-                    real_mse = calculate_real_mse(preds, batch["target"], scaler_t)
-                    for i, mse in enumerate(real_mse):
+                    inputs = batch["input"].to(DEVICE)
+                    targets = batch["target"].to(DEVICE)
+                    
+                    preds = model(inputs)
+                    
+                    # Overall normalized MSE
+                    vals.append(eval_criterion(preds, targets).item())
+                    
+                    # Per-target normalized MSE
+                    target_mses = target_specific_mse(preds, targets)
+                    for i, mse in enumerate(target_mses):
+                        target_vals[i].append(mse)
+                    
+                    # Real-unit MSE per target
+                    real_target_mses = calculate_real_mse(preds, targets, y_scaler)
+                    for i, mse in enumerate(real_target_mses):
                         real_vals[i].append(mse)
-
-            cur=np.mean(vals)
-            if cur<best: 
-                best=cur
-                best_real_mse = [np.mean(vals_per_target) for vals_per_target in real_vals]
-                no_improve=0
+            
+            # Calculate mean MSE (normalized and real)
+            cur = np.mean(vals)
+            norm_target_means = [np.mean(t_vals) for t_vals in target_vals]
+            real_target_means = [np.mean(r_vals) for r_vals in real_vals]
+            
+            # Track best performance (using normalized MSE for decision)
+            if cur < best:
+                best = cur
+                best_target_mses = norm_target_means 
+                best_real_target_mses = real_target_means
+                no_improve = 0
             else:
-                no_improve+=1
-                if no_improve>=patience: break
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+                    
         logger.info(f"Fold {fold}/{k}  MSE={best:.5f} (normalized)")
-        logger.info(f"  Real units: " + " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_mse)]))
+        logger.info(f"Real units MSE: " + 
+                   " | ".join([f"{TARGET_COLS[i]}={mse:.4f}" for i, mse in enumerate(best_real_target_mses)]))
+        
         scores.append(best)
         fold_scores.append(best)
-    logger.info(f"Thesis system CV → {np.mean(scores):.5f} ± {np.std(scores):.5f}\n")
-    return np.mean(scores), fold_scores
-
+        
+        # Add target-specific scores
+        for i, mse in enumerate(best_target_mses):
+            target_scores[i].append(mse)
+        for i, mse in enumerate(best_real_target_mses):
+            real_target_scores[i].append(mse)
+    
+    # Overall results
+    mean_score = np.mean(scores)
+    std_score = np.std(scores)
+    logger.info(f"Thesis CV →  {mean_score:.5f} ± {std_score:.5f}")
+    
+    # Target-specific results
+    for i, target in enumerate(TARGET_COLS):
+        target_mean = np.mean(target_scores[i])
+        target_std = np.std(target_scores[i])
+        logger.info(f"  {target} →  {target_mean:.5f} ± {target_std:.5f}")
+        
+    logger.info("")
+    
+    return mean_score, fold_scores, target_scores, real_target_scores
 
 # --------------------------------------------------------------------------
 # Main entry
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Script starting...")
     # Create a timestamped results file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_file = f"kfold_results_{timestamp}.txt"
@@ -674,6 +821,20 @@ if __name__ == "__main__":
     all_results = {"benchmark": [], "subnet": [], "thesis": []}
     fold_results = {"benchmark": [], "subnet": [], "thesis": []}
     
+    # Create target-specific result containers
+    target_results = {
+        "benchmark": {t: [] for t in TARGET_COLS},
+        "subnet": {t: [] for t in TARGET_COLS},
+        "thesis": {t: [] for t in TARGET_COLS}
+    }
+    
+    # Additional storage for real-unit metrics
+    real_target_results = {
+        "benchmark": {t: [] for t in TARGET_COLS},
+        "subnet": {t: [] for t in TARGET_COLS},
+        "thesis": {t: [] for t in TARGET_COLS}
+    }
+    
     for repeat in range(N_REPEATS):
         repeat_header = f"\n==========  REPEAT {repeat+1}/{N_REPEATS}  =========="
         logger.info(repeat_header)  
@@ -683,20 +844,38 @@ if __name__ == "__main__":
         set_training_seeds(repeat + 1000)
         
         # Run each system and log results to both console and file
-        bench_score, bench_folds = run_benchmark_cv()
+        bench_score, bench_folds, bench_targets, bench_real_targets = run_benchmark_cv()
         all_results["benchmark"].append(bench_score)
         fold_results["benchmark"].extend([(repeat+1, i+1, score) for i, score in enumerate(bench_folds)])
         write_results_to_file(results_file, f"Benchmark System: {bench_score:.5f}")
+        # Add target results
+        for i, target in enumerate(TARGET_COLS):
+            target_results["benchmark"][target].append(np.mean(bench_targets[i]))
+            real_target_results["benchmark"][target].append(np.mean(bench_real_targets[i]))
+            write_results_to_file(results_file, f"  {target}: {np.mean(bench_targets[i]):.5f}")
+            write_results_to_file(results_file, f"  {target} (real units): {np.mean(bench_real_targets[i]):.4f}")
         
-        subnet_score, subnet_folds = run_subnet_cv()
+        subnet_score, subnet_folds, subnet_targets, subnet_real_targets = run_subnet_cv()
         all_results["subnet"].append(subnet_score)
         fold_results["subnet"].extend([(repeat+1, i+1, score) for i, score in enumerate(subnet_folds)])
         write_results_to_file(results_file, f"Sub-network System: {subnet_score:.5f}")
+        # Add target results
+        for i, target in enumerate(TARGET_COLS):
+            target_results["subnet"][target].append(np.mean(subnet_targets[i]))
+            real_target_results["subnet"][target].append(np.mean(subnet_real_targets[i]))
+            write_results_to_file(results_file, f"  {target}: {np.mean(subnet_targets[i]):.5f}")
+            write_results_to_file(results_file, f"  {target} (real units): {np.mean(subnet_real_targets[i]):.4f}")
         
-        thesis_score, thesis_folds = run_thesis_cv()
+        thesis_score, thesis_folds, thesis_targets, thesis_real_targets = run_thesis_cv()
         all_results["thesis"].append(thesis_score)
         fold_results["thesis"].extend([(repeat+1, i+1, score) for i, score in enumerate(thesis_folds)])
         write_results_to_file(results_file, f"Thesis System: {thesis_score:.5f}")
+        # Add target results
+        for i, target in enumerate(TARGET_COLS):
+            target_results["thesis"][target].append(np.mean(thesis_targets[i]))
+            real_target_results["thesis"][target].append(np.mean(thesis_real_targets[i]))
+            write_results_to_file(results_file, f"  {target}: {np.mean(thesis_targets[i]):.5f}")
+            write_results_to_file(results_file, f"  {target} (real units): {np.mean(thesis_real_targets[i]):.4f}")
     
     # Write all fold results
     write_results_to_file(results_file, "\n\n" + "="*80)
@@ -711,26 +890,52 @@ if __name__ == "__main__":
         for repeat, fold, score in results:
             write_results_to_file(results_file, f"{repeat:6d} | {fold:4d} | {score:.5f}")
     
-    # Calculate and display final statistics across repeats
-    final_header = "\n\n========== FINAL RESULTS (ACROSS REPEATS) =========="
-    logger.info(final_header)  # Log to console
+    # Skip the overall normalized average results section
+    # and go directly to target-specific results
+
+    # Target-specific final results
     write_results_to_file(results_file, "\n\n" + "="*80)
-    write_results_to_file(results_file, "FINAL RESULTS (ACROSS REPEATS)")
+    write_results_to_file(results_file, "TARGET-SPECIFIC RESULTS (NORMALIZED, ACROSS REPEATS)")
     write_results_to_file(results_file, "="*80)
     
-    for name, runs in all_results.items():
-        runs = np.array(runs)
-        mean, std = runs.mean(), runs.std()
+    logger.info("\n========== TARGET-SPECIFIC RESULTS (NORMALIZED) ==========")
+    
+    for target in TARGET_COLS:
+        logger.info(f"\nTarget: {target}")
+        write_results_to_file(results_file, f"\nTarget: {target}")
+        write_results_to_file(results_file, "-"*40)
         
-        console_msg = f"{name.capitalize():10} →  {mean:.5f} ± {std:.5f} (across {N_REPEATS} repeats)"
-        logger.info(console_msg)
+        for system in ["benchmark", "subnet", "thesis"]:
+            runs = np.array(target_results[system][target])
+            mean, std = runs.mean(), runs.std()
+            
+            console_msg = f"{system.capitalize():10} →  {mean:.5f} ± {std:.5f}"
+            logger.info(console_msg)
+            
+            file_msg = f"{system.capitalize():10} ->  {mean:.5f} +/- {std:.5f}"
+            write_results_to_file(results_file, file_msg)
+    
+    # Target-specific real units final results
+    write_results_to_file(results_file, "\n\n" + "="*80)
+    write_results_to_file(results_file, "TARGET-SPECIFIC RESULTS IN REAL UNITS (ACROSS REPEATS)")
+    write_results_to_file(results_file, "="*80)
+
+    logger.info("\n========== TARGET-SPECIFIC RESULTS (REAL UNITS) ==========")
+
+    for target in TARGET_COLS:
+        logger.info(f"\nTarget: {target}")
+        write_results_to_file(results_file, f"\nTarget: {target}")
+        write_results_to_file(results_file, "-"*40)
         
-        file_msg = f"{name.capitalize():10} ->  {mean:.5f} +/- {std:.5f} (across {N_REPEATS} repeats)"
-        write_results_to_file(results_file, file_msg)
-        
-        min_max_msg = f"{' '*12}Min: {runs.min():.5f}, Max: {runs.max():.5f}"
-        logger.info(min_max_msg)
-        write_results_to_file(results_file, min_max_msg)
+        for system in ["benchmark", "subnet", "thesis"]:
+            runs = np.array(real_target_results[system][target])
+            mean, std = runs.mean(), runs.std()
+            
+            console_msg = f"{system.capitalize():10} →  {mean:.4f} ± {std:.4f} (real units)"
+            logger.info(console_msg)
+            
+            file_msg = f"{system.capitalize():10} ->  {mean:.4f} +/- {std:.4f} (real units)"
+            write_results_to_file(results_file, file_msg)
     
     write_results_to_file(results_file, f"\nCompleted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Detailed results saved to: {results_file}")
