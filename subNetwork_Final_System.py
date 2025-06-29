@@ -3,7 +3,7 @@ Hierarchical-MLP quality-prediction training pipeline
 =====================================================
 •   <product>/                              
         ├─ <product>.xlsx  (80 rows × 8 process cols + 3 target cols)
-        └─ <anything>.npy  (voxel grid)
+        └─ npy file        (voxel grid)
 
 The model now consists of **three** MLPs:
     ▸ MLP_lat   : maps the AE latent vector  →  R^h_lat
@@ -144,14 +144,14 @@ class FinalAutoencoder3D(nn.Module):
         return self.decode(self.encode(x))
 
 def load_autoencoder(path:str, device, latent_dim:int=256):
-    chk = torch.load(path, map_location=device)
-    sd  = chk["model_state_dict"] if "model_state_dict" in chk else chk
+    chk = torch.load(path, map_location=device) # loads full checkpoint
+    sd  = chk["model_state_dict"] if "model_state_dict" in chk else chk 
     
     # Filter to ONLY include encoder parameters and ignore decoder completely 
     encoder_sd = {k: v for k, v in sd.items() if k.startswith('encoder.') or k.startswith('fc_mu.')}
     
     model = FinalAutoencoder3D(latent_dim).to(device)
-    model.load_state_dict(encoder_sd, strict=False)
+    model.load_state_dict(encoder_sd, strict=False) # load only encoder weights
     model.eval()
     logger.info(f"Loaded AE encoder from {path} ({len(encoder_sd)} parameters)")
     return model
@@ -268,6 +268,10 @@ def make_optimizer(name, params, lr):
     if name=="adagrad":return optim.Adagrad(params, lr=lr)
     raise ValueError(name)
 
+def inverse_transform_tgt(arr, scaler: StandardScaler):
+    """Convert scaled targets back to physical units"""
+    return scaler.inverse_transform(arr.astype(np.float32))
+
 # ────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ────────────────────────────────────────────────────────────────────────────
@@ -275,9 +279,9 @@ class Trainer:
     def __init__(self,
         main_folder, autoencoder_path, latent_dim,
         proc_cols, tgt_cols,
-        batch_range=(8,64), val_ratio=.1, test_ratio=.2, random_state=42,
+        batch_range=(8,128), val_ratio=.1, test_ratio=.2, random_state=42,
         n_trials=200, study_name="hier_mlp", storage=None,
-        output_dir="Subnetwork_Results",  # Add output directory parameter
+        output_dir="Subnetwork_Results",  
     ):
         self.main = Path(main_folder)
         self.proc_cols, self.tgt_cols = list(proc_cols), list(tgt_cols)
@@ -484,9 +488,13 @@ class Trainer:
         # Convert lists of batches to full arrays
         all_predictions = np.vstack(all_predictions)
         all_targets = np.vstack(all_targets)
-        
-        # Save test results to CSV
-        self._save_test_results_csv(test_loss, all_predictions, all_targets)
+
+        # Convert to physical units for CSV export
+        pred_phys = inverse_transform_tgt(all_predictions, self.scaler_tgt)
+        true_phys = inverse_transform_tgt(all_targets, self.scaler_tgt)
+
+        # Save test results to CSV with physical units
+        self._save_test_results_csv(test_loss, pred_phys, true_phys)
         
         # Save study results to text file
         self._save_study_results(study)
