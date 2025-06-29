@@ -1,24 +1,5 @@
 from __future__ import annotations
 # kfold_all_systems.py
-"""
-Grouped k‑fold cross‑validation for ALL three network types used in the thesis:
---------------------------------------------------------------------------
-1. **Benchmark System** – classic MLP on 12 geometric + process features
-2. **Sub‑Network System** – hierarchical 3‑tower network (latent / process / fusion)
-3. **Thesis / Normal System** – latent vector concatenated with 8 process parameters (of which 4 are gate location related)
-
-For every product the rows belong to the same fold (GroupKFold on "product_name").
-The exact (already optimised) architectures + hyper‑parameters are hard‑coded below.
-Adjust only `MAIN_FOLDER_*` and (optionally) `AE_WEIGHTS` to fit your directory layout.
-
-Usage
------
-python kfold_all_systems.py
-
-after installing the Python packages listed at the top of the file.
-The script prints the mean ± std validation MSE for each system.
-"""
-
 
 """"
 I think the SGD gradient is exploding in the benchmark system. 
