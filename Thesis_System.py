@@ -92,12 +92,16 @@ class FinalAutoencoder3D(nn.Module):
     def forward(self,x): return self.decode(self.encode(x))
 
 def load_autoencoder(path:str, device, latent_dim:int=256):
-    chk = torch.load(path, map_location=device)
-    sd  = chk["model_state_dict"] if "model_state_dict" in chk else chk
+    chk = torch.load(path, map_location=device) # loads full checkpoint
+    sd  = chk["model_state_dict"] if "model_state_dict" in chk else chk 
+    
+    # Filter to ONLY include encoder parameters and ignore decoder completely 
+    encoder_sd = {k: v for k, v in sd.items() if k.startswith('encoder.') or k.startswith('fc_mu.')}
+    
     model = FinalAutoencoder3D(latent_dim).to(device)
-    model.load_state_dict(sd)
+    model.load_state_dict(encoder_sd, strict=False) # load only encoder weights
     model.eval()
-    logger.info(f"Loaded AE from {path}")
+    logger.info(f"Loaded AE encoder from {path} ({len(encoder_sd)} parameters)")
     return model
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -182,8 +186,8 @@ class InjectionMoldingDataset(Dataset):
 
     def __getitem__(self, idx):
         row  = self.df.iloc[idx]
-        lat  = self.latent_cache[row["cad_model_file"]]
-        proc = self.proc_arr[idx]
+        lat  = self.latent_cache[row["cad_model_file"]] # Get the precomputed latent vector for this product
+        proc = self.proc_arr[idx] # Get the process parameters for this row
         # Here the latent vector and process parameters are concatenated into a single input vector 
         x = np.concatenate([lat, proc])
         y = self.tgt_arr[idx]
