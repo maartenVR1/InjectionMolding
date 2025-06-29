@@ -106,6 +106,10 @@ def load_autoencoder(path:str, device, latent_dim:int=256):
 class InjectionMoldingDataset(Dataset):
     """
     One row =  [ latent  ⨁  process params ]  →  targets
+    So this is where the autoencoder is used to encode the 3D model, concatenates with the other parameters and then gets the targets.
+
+    I tried to make sure it relatively easy to change this autoencoder out for another one, if you want to improve its performance or use a different architecture
+    or type of autoencoder.
     """
     def __init__(
         self,
