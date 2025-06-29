@@ -4,7 +4,7 @@ MLP quality-prediction training pipeline
 * scans   <MAIN_FOLDER>  where each product has its own sub-folder
 * expects <product>/                               
       ├─ <product>.xlsx  (80 rows × 8 process cols + 3 target cols)
-      └─ <anything>.npy  (voxel grid, 1 per product)
+      └─ npy file  (voxel grid, 1 per product)
 
 * learns an MLP that receives
       [ latent-vector (from pretrained 3-D AE)  ⨁  8 process parameters ]
@@ -85,7 +85,7 @@ class FinalAutoencoder3D(nn.Module):
     @property
     def device(self): return self._device
     def to(self, device): super().to(device); self._device = device; return self
-    def encode(self,x): return self.fc_mu(self.encoder(x).flatten(1))
+    def encode(self,x): return self.fc_mu(self.encoder(x).flatten(1)) # this is the latent space vector we want
     def decode(self,z):
         x = self.fc_dec(z).view(-1,128,8,8,8)
         return self.decoder(x)
@@ -138,7 +138,7 @@ class InjectionMoldingDataset(Dataset):
         else:
             self.tgt_arr = self.df[self.tgt_cols].values.astype(float)
 
-        # cache latent per product
+        # cache latent vector per product
         self.latent_cache = {}  # Dictionary to store encoded 3D representations for each product
         with torch.no_grad():  # Disable gradient tracking for memory efficiency during encoding
             # Extract unique product-voxel file pairs to avoid redundant processing
@@ -307,7 +307,7 @@ class MLPTrainer:
             pd.DataFrame: Combined dataframe with all products' data
         """
         rows = []  # List to store DataFrames for each product
-        
+        product = 1
         # Scan through each item in the main folder
         for prod_dir in self.main_folder.iterdir():
             # Skip if it's not a directory (e.g., if it's a file)
@@ -322,6 +322,12 @@ class MLPTrainer:
                 logger.warning(f"Skipping {prod_dir.name} (xlsx/npy missing)")
                 continue
             
+            '''
+            # just checking if its loading all products
+            print(f'loading product number {product}')  # Progress indicator
+            product += 1
+            '''
+
             # Load the Excel file into a DataFrame
             df = pd.read_excel(xl[0])  # Take the first Excel file if multiple exist
             
@@ -357,7 +363,6 @@ class MLPTrainer:
         with open("canonical_product_split.json", "r") as f:
             product_split = json.load(f)
         
-        # Log detailed information about which products are in each split for transparency
         # This helps document exactly which products were used for training/validation/testing
         logger.info("Using canonical product split:")
         logger.info(f"Train products: {len(product_split['train_products'])} - {product_split['train_products']}")
@@ -379,17 +384,11 @@ class MLPTrainer:
             self.train_df,self.main_folder,self.autoencoder,
             self.proc_cols,self.tgt_cols,
             self.scaler_proc,self.scaler_tgt,DEVICE)
-        
-        # Only create validation dataset if DataFrame is not empty
-        if not self.val_df.empty:
-            val_ds = InjectionMoldingDataset(
-                self.val_df,self.main_folder,self.autoencoder,
-                self.proc_cols,self.tgt_cols,
-                self.scaler_proc,self.scaler_tgt,DEVICE)
-            val_loader = DataLoader(val_ds,batch,shuffle=False,**kws)
-        else:
-            # Return None for empty validation set
-            val_loader = None
+    
+        val_ds = InjectionMoldingDataset(
+            self.val_df,self.main_folder,self.autoencoder,
+            self.proc_cols,self.tgt_cols,
+            self.scaler_proc,self.scaler_tgt,DEVICE)           
         
         test_ds = InjectionMoldingDataset(
             self.test_df,self.main_folder,self.autoencoder,
@@ -398,7 +397,7 @@ class MLPTrainer:
 
         return (
             DataLoader(train_ds,batch,shuffle=True,**kws),
-            val_loader,
+            DataLoader(val_ds,batch,shuffle=False,**kws),
             DataLoader(test_ds,batch,shuffle=False,**kws),
         )
 
@@ -427,7 +426,7 @@ class MLPTrainer:
 
     # ─────────────────────────────────  Optuna objective  ───────────────────
     def _objective(self, trial:Trial):
-        # Existing hyperparameter suggestions
+        
         hl  = trial.suggest_int("hidden_layers",1,10)
         neu = [trial.suggest_int(f"n{i}",16,512,log=True) for i in range(hl)]
         act = trial.suggest_categorical("act", ["relu","leaky_relu","elu","tanh","selu"])
@@ -460,7 +459,7 @@ class MLPTrainer:
         opt = make_optimizer(opt_name, model.parameters(), lr)
 
         best_val=float("inf"); best_ep=0
-        for epoch in range(250):
+        for epoch in range(250): #epochs for training
             # ----- TRAINING -----
             model.train()
             for b in train_dl: #b is a batch of data
@@ -534,13 +533,13 @@ class MLPTrainer:
         
         logger.info(f"Full study results saved to {out_path}")
 
-    def _save_test_results_csv(self, train_loss, eval_loss, pred_values, true_values):
+    def _save_test_results_csv(self, train_loss, eval_loss, pred_values, true_values, loss_fn_name):
         
         # Save summary metrics
         metrics_path = self.output_dir / f"test_metrics_{self.study_name}.csv"
         with open(metrics_path, "w") as f:
             f.write("Metric,Value\n")
-            f.write(f"Test_{study.best_params['loss_fn']},{train_loss:.6f}\n")
+            f.write(f"Test_{loss_fn_name},{train_loss:.6f}\n")
             f.write(f"Test_MSE,{eval_loss:.6f}\n")
             
             # Calculate per-target MSE
@@ -578,7 +577,6 @@ class MLPTrainer:
         logger.info(f"Test metrics saved to {metrics_path}")
         logger.info(f"Test predictions saved to {predictions_path}")
 
-    # ───────────────────────────────────────── public API ────────────────────
     def optimize(self):
         study = optuna.create_study(
             direction="minimize", study_name=self.study_name,
@@ -590,7 +588,7 @@ class MLPTrainer:
         logger.info(f"Best loss (val) : {study.best_value:.5f}")
         logger.info(f"Best params     : {study.best_params}")
         
-        # ---------- train on train+val with best params
+        # ---------- Final Training With The Best Parameters -------------------------------
         p=study.best_params
         neu=[p[f"n{i}"] for i in range(p["hidden_layers"])]
         model=MLPQualityPredictor(self.input_dim,self.output_dim,
@@ -598,8 +596,23 @@ class MLPTrainer:
                                   p["act"],p["dropout"]).to(DEVICE)
         batch=p["batch"]
         tv_df=pd.concat([self.train_df,self.val_df],ignore_index=True)
-        self.train_df=tv_df; self.val_df=pd.DataFrame([])  # reuse factory
-        train_dl,_,test_dl=self._make_dloaders(batch)
+
+        # Re-fit scalers on the combined train+val data
+        self.scaler_proc = StandardScaler().fit(
+            tv_df[self.proc_cols].values.astype(float))
+        self.scaler_tgt = StandardScaler().fit(
+            tv_df[self.tgt_cols].values.astype(float))
+
+        # Avoid div-by-zero for constant cols
+        self.scaler_proc.scale_[self.scaler_proc.scale_ == 0] = 1.0
+        self.scaler_tgt.scale_[self.scaler_tgt.scale_ == 0] = 1.0
+
+        # Update class attributes
+        self.train_df = tv_df
+        self.val_df = pd.DataFrame([])
+
+        # Now create data loaders
+        train_dl, _, test_dl = self._make_dloaders(batch)
 
         # Use best training loss function from optimization
         crit_train = make_loss_function(p["loss_fn"])
@@ -609,7 +622,7 @@ class MLPTrainer:
         
         opt = make_optimizer(p["optimizer"], model.parameters(), p["lr"])
 
-        for _ in range(150):
+        for _ in range(150): # epochs for final training
             model.train()
             for b in train_dl:
                 x=b["input"].to(DEVICE); y=b["target"].to(DEVICE)
@@ -649,7 +662,7 @@ class MLPTrainer:
         all_predictions = np.vstack(all_predictions)
         all_targets = np.vstack(all_targets)
         self._save_test_results_csv(test_train_loss_avg, test_eval_loss_avg, 
-                                   all_predictions, all_targets)
+                                   all_predictions, all_targets, p["loss_fn"])
         
         self._save_study_results(study)
         
@@ -723,10 +736,11 @@ TGT_COLS = ("CavityWeight", "MaxWarp", "VolumetricShrinkage")
 # Main
 # ────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    ' Thesis system is the direct latent space implementation, hopefully this is clear'
     MAIN_FOLDER = r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master thesis\code\SYSTEM\TrainingData_Thesis_System"
     AUTOENCODER_PATH = r"C:\Users\maart\OneDrive - KU Leuven\KUL\MOAI\Master thesis\code\SYSTEM\autoencoder_best.pt"
     OUTPUT_DIR = "Thesis_System_Results"  
-    
+     
     trainer = MLPTrainer(
         main_folder = MAIN_FOLDER,
         autoencoder_path = AUTOENCODER_PATH,

@@ -1,3 +1,5 @@
 Niet de average normalized resultaten van de KFoldPerTarget code gebruiken, maar van de Kfold code
 KFoldPerTarget heeft data leakage omdat de standardscalar over de hele training set wordt berekend in plaats van over de training set in de huidige fold
 Moet verwijdered worden
+
+de code gaat niet runnen want de autoencoder file is te groot voor github
